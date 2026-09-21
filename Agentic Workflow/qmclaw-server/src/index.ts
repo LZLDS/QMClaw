@@ -32,8 +32,9 @@ try {
 const USE_MICROSERVICES = process.env.QMCLAW_USE_SERVICES === "false"
   ? false
   : (servicesConfig.mode?.use_microservices ?? true);
+console.log("[Server] Config use_microservices:", servicesConfig.mode?.use_microservices);
+console.log("[Server] QMCLAW_USE_SERVICES env:", process.env.QMCLAW_USE_SERVICES);
 console.log("[Server] Mode:", USE_MICROSERVICES ? "Microservices" : "Legacy (job_runner.py)");
-console.log("[Server] Mode config source:", process.env.QMCLAW_USE_SERVICES ? "ENV" : "services.json");
 
 // Load environment variables from .env file (override existing to ensure .env takes precedence)
 import dotenv from "dotenv";
@@ -147,6 +148,11 @@ function shouldPrintLog(line: string): boolean {
     line.includes("SINGLE_NODE:") ||  // ✅ SINGLE_NODE: - 单节点执行
     line.includes(">>> FORCE LOG") ||  // ✅ FORCE LOG - 强制日志
     line.includes("INIT: Starting backend initialization") ||  // ✅ INIT: backend init开始
+
+    // ── 降级模式日志（默认显示）───────────────────────────────────────────────
+    line.includes("[FallbackManager]") ||  // ✅ FallbackManager - 降级管理器
+    line.includes("[quantum_service]") ||  // ✅ quantum_service - 量子服务日志
+    line.includes("[analysis_service]") ||  // ✅ analysis_service - 分析服务日志
 
     // ── 以下默认隐藏 ──────────────────────────────────────────────────────────
     // line.includes("INIT:") ||  // ❌ INIT: - 初始化日志
@@ -310,16 +316,17 @@ const backendPendingRequests = new Map<string, backendPendingEntry>();
 
 // ── Microservice Proxy Function ─────────────────────────────────────────────────
 
-type ServiceName = 'quantum' | 'analysis' | 'agent' | 'hermes' | 'llm' | 'image' | 'workflow';
+type ServiceName = 'quantum' | 'analysis' | 'agent' | 'hermes' | 'llm' | 'image' | 'workflow' | 'qca';
 
 const SERVICE_PORTS: Record<ServiceName, number> = {
   quantum: 3003,
   analysis: 3004,
   agent: 3005,
-  hermes: 3005,   // Hermes uses agent service port
+  hermes: 3012,   // Hermes has its own service on port 3012
   llm: 3006,
   image: 3007,
   workflow: 3008,
+  qca: 3011,
 };
 
 interface ProxyResult {
@@ -342,9 +349,14 @@ async function proxyToService(
   method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   body?: unknown,
   isFormData = false,
+  query?: Record<string, string>,
 ): Promise<ProxyResult> {
-  const port = SERVICE_PORTS[service] || 3003;
-  const url = `http://localhost:${port}${path}`;
+  // Build URL with query parameters if provided
+  let url = `http://localhost:${SERVICE_PORTS[service] || 3003}${path}`;
+  if (query && Object.keys(query).length > 0) {
+    const params = new URLSearchParams(query);
+    url += `?${params.toString()}`;
+  }
 
   console.log(`[Proxy] ${method} ${service} -> ${url}`);
 
@@ -484,7 +496,12 @@ app.use(cors({
   origin: true,  // 允许所有来源（包括 localhost:3001, 127.0.0.1:8081 等）
   credentials: true,
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+
+// ── Static Files ────────────────────────────────────────────────────────────
+// Serve plot images from qmclaw-web/public/plots directory
+const plotsDir = path.join(__dirname, "..", "..", "qmclaw-web", "public", "plots");
+app.use('/plots', express.static(plotsDir));
 
 // ── Service Proxy ───────────────────────────────────────────────────────────
 // 代理请求到各微服务 (挂载到 /api 前缀)
@@ -979,6 +996,8 @@ app.get("/health", async (_req, res) => {
         image: "http://localhost:3007",
         workflow: "http://localhost:3008",
         task_queue: "http://localhost:3009",
+        qubitclient: "http://localhost:3010",
+        qca: "http://localhost:3011",
       },
     });
     return;
@@ -1073,7 +1092,8 @@ if _fig and _fig.get_size_inches().prod() > 0:
     # Save the plot (modified or original)
     _path = os.path.join(_plots_dir, "${jobId}.png")
     _fig.savefig(_path, dpi=150, bbox_inches='tight')
-    print(f"QMCLAW_PLOT:{_path}")
+    # Print relative URL for browser compatibility (not absolute path)
+    print(f"QMCLAW_PLOT:/plots/${jobId}.png")
     if _plot_modified:
         print(f"QMCLAW_PLOT_MODIFIED:True")
     if _plot_created:
@@ -2461,16 +2481,27 @@ app.post("/api/agent/memory/reflect", async (req, res) => {
 
 /** POST /api/hermes/chat — Hermes agent chat */
 app.post("/api/hermes/chat", async (req, res) => {
+  console.log('[Hermes] /api/hermes/chat called');
+  console.log('[Hermes] USE_MICROSERVICES:', USE_MICROSERVICES);
+  console.log('[Hermes] Request body:', JSON.stringify(req.body, null, 2));
+
   if (USE_MICROSERVICES) {
     const { message, model, base_url, enabled_toolsets, session_id } = req.body as {
       message?: string; model?: string; base_url?: string; enabled_toolsets?: string[]; session_id?: string;
     };
     if (!message) { res.status(400).json({ error: "message is required" }); return; }
+
+    console.log('[Hermes] Proxying to hermes service:', { model, base_url, enabled_toolsets });
+
     const result = await proxyToService('hermes', '/chat', 'POST', {
       message, model, base_url, enabled_toolsets, session_id,
     });
+
+    console.log('[Hermes] proxyToService result:', JSON.stringify(result, null, 2));
+
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   } else {
+    console.log('[Hermes] Using legacy backend mode');
     try {
       const { message, model, base_url, enabled_toolsets, session_id } = req.body as {
         message?: string; model?: string; base_url?: string; enabled_toolsets?: string[]; session_id?: string;
@@ -2479,9 +2510,13 @@ app.post("/api/hermes/chat", async (req, res) => {
       const data = await sendbackendRequest("hermes_chat", {
         message, model, base_url, enabled_toolsets, session_id,
       }, 600_000) as Record<string, unknown>;
+      console.log('[Hermes] backend result:', JSON.stringify(data, null, 2));
       if (data.error) { res.status(502).json({ error: data.error }); return; }
       res.json(data);
-    } catch (err: any) { res.status(502).json({ error: err.message }); }
+    } catch (err: any) {
+      console.error('[Hermes] Backend error:', err.message);
+      res.status(502).json({ error: err.message });
+    }
   }
 });
 
@@ -2499,16 +2534,39 @@ app.post("/api/hermes/chat/stream", async (req, res) => {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
-    const result = await proxyToService('hermes', '/chat/stream', 'POST', { message, model, base_url, session_id }, false);
-    if (!result.ok) {
-      res.write(`event: error\ndata: ${JSON.stringify({ error: result.error })}\n\n`);
-      res.end();
-      return;
+    // For microservice mode, use synchronous /chat and convert to SSE
+    console.log('[Hermes SSE] Using microservice mode with /chat API');
+
+    try {
+      const result = await proxyToService('hermes', '/chat', 'POST', {
+        message, model, base_url, session_id
+      }) as any;
+
+      if (!result.ok) {
+        res.write(`event: error\ndata: ${JSON.stringify({ error: result.error || "Service error" })}\n\n`);
+        res.end();
+        return;
+      }
+
+      const data = result.data || {};
+
+      // Send result as SSE done event
+      if (data.error) {
+        res.write(`event: error\ndata: ${JSON.stringify({ error: data.error })}\n\n`);
+      } else {
+        // Send response as done
+        res.write(`event: done\ndata: ${JSON.stringify({
+          completed: data.completed || true,
+          final_response: data.final_response || data.response || "",
+        })}\n\n`);
+      }
+    } catch (err: any) {
+      console.error('[Hermes SSE] Error:', err.message);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
     }
-    res.write(result.data);
     res.end();
   } else {
-    console.log('[Hermes SSE] /api/hermes/chat/stream called');
+    console.log('[Hermes SSE] Using legacy backend mode');
     try {
       const { message, model, base_url, session_id } = req.body as {
         message?: string; model?: string; base_url?: string; session_id?: string;
@@ -2944,6 +3002,46 @@ app.post("/api/analysis/plot/experiments", async (req, res) => {
   }
 });
 
+/** GET/POST /api/analysis/mode — get/set offline mode (microservice) */
+app.get("/api/analysis/mode", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('analysis', '/mode', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Mode not available in legacy mode" });
+  }
+});
+
+app.post("/api/analysis/mode", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const body = req.body;
+    const result = await proxyToService('analysis', '/mode', 'POST', body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Mode not available in legacy mode" });
+  }
+});
+
+/** GET /api/analysis/datasets/offline — list offline datasets (microservice) */
+app.get("/api/analysis/datasets/offline", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('analysis', '/datasets/offline', 'GET', null, req.query as Record<string, string>);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Not available in legacy mode" });
+  }
+});
+
+/** POST /api/analysis/plot/offline — plot offline dataset (microservice) */
+app.post("/api/analysis/plot/offline", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('analysis', '/plot/offline', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Not available in legacy mode" });
+  }
+});
+
 /** GET /qubits/:name/params — get qubit parameters (microservice) */
 app.get("/qubits/:name/params", async (req, res) => {
   if (USE_MICROSERVICES) {
@@ -3082,6 +3180,26 @@ app.get("/api/quantum/qubits", async (_req, res) => {
   }
 });
 
+/** GET/POST /api/quantum/mode — get/set offline mode (microservice) */
+app.get("/api/quantum/mode", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/mode', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Mode not available in legacy mode" });
+  }
+});
+
+app.post("/api/quantum/mode", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const body = req.body;
+    const result = await proxyToService('quantum', '/mode', 'POST', body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Mode not available in legacy mode" });
+  }
+});
+
 /** GET /api/quantum/sessions — get sessions (microservice) */
 app.get("/api/quantum/sessions", async (_req, res) => {
   if (USE_MICROSERVICES) {
@@ -3112,6 +3230,12 @@ app.get("/hardware/status", async (_req, res) => {
         },
         devices: {},
         issues: quantumData.labrad_connected ? [] : ["LabRAD not connected"],
+        // 降级模式信息
+        fallback: {
+          mode: quantumData.fallback_mode ?? false,
+          state: quantumData.fallback_state ?? "unknown",
+          message: quantumData.fallback_message ?? "",
+        },
       });
     } catch (err: any) {
       res.status(502).json({ error: err.message });
@@ -3138,12 +3262,25 @@ app.get("/hardware/quick", async (_req, res) => {
       const llmHealth = await fetch("http://localhost:3006/health", { signal: AbortSignal.timeout(3000) });
       const quantumData = quantumHealth.ok ? await quantumHealth.json() : {};
       const llmData = llmHealth.ok ? await llmHealth.json() : {};
+
+      // 判断降级模式
+      const isFallback = quantumData.fallback_mode ?? false;
+      const fallbackMessage = quantumData.fallback_message ?? "";
+
       res.json({
-        labrad: quantumData.labrad_connected ? "connected" : "disconnected",
+        labrad: quantumData.labrad_connected ? "connected" : (isFallback ? "degraded" : "disconnected"),
         llm: llmData.status === "healthy" ? "ready" : "unavailable",
         ray: "via_quantum",
         datavault: quantumData.datalab_connected ? "connected" : "disconnected",
-        message: `Microservices mode - Quantum: ${quantumData.labrad_connected ? 'connected' : 'disconnected'}`,
+        // 降级模式信息
+        fallback: {
+          mode: isFallback,
+          state: quantumData.fallback_state ?? "unknown",
+          message: fallbackMessage,
+        },
+        message: isFallback
+          ? `降级模式 - ${fallbackMessage}`
+          : `Microservices mode - Quantum: ${quantumData.labrad_connected ? 'connected' : 'disconnected'}`,
       });
     } catch (err: any) {
       res.json({
@@ -3151,6 +3288,11 @@ app.get("/hardware/quick", async (_req, res) => {
         llm: "unavailable",
         ray: "unknown",
         datavault: "unknown",
+        fallback: {
+          mode: true,
+          state: "error",
+          message: "无法连接到量子服务",
+        },
         message: "Microservices health check failed: " + err.message,
       });
     }

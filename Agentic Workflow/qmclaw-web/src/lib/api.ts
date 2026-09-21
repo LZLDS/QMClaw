@@ -16,6 +16,20 @@
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
 
+/**
+ * Convert a plot path to a full URL for the browser to load.
+ * Handles relative paths (/plots/...), absolute paths (D:\...), and full URLs.
+ */
+export function normalizePlotUrl(path: string | undefined | null): string | null {
+  if (!path) return null;
+  // Already a full URL or data URL
+  if (path.startsWith('http') || path.startsWith('data:')) return path;
+  // Relative path starting with /
+  if (path.startsWith('/')) return `${API_BASE}${path}`;
+  // Assume it's a filename in the plots directory
+  return `${API_BASE}/plots/${path}`;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface JobResult {
@@ -199,6 +213,36 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code, timeout }),
     });
+    return res.json();
+  },
+
+  /**
+   * Get/Set offline mode for quantum service
+   */
+  quantumMode: async (mode?: "online" | "offline" | "auto") => {
+    if (mode) {
+      const res = await fetch(`${API_BASE}/api/quantum/mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      return res.json();
+    } else {
+      const res = await fetch(`${API_BASE}/api/quantum/mode`);
+      return res.json();
+    }
+  },
+
+  /**
+   * List offline datasets
+   */
+  listOfflineDatasets: async (params?: { qubit?: string; experiment_type?: string; date?: string }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.qubit) searchParams.set("qubit", params.qubit);
+    if (params?.experiment_type) searchParams.set("experiment_type", params.experiment_type);
+    if (params?.date) searchParams.set("date", params.date);
+    const query = searchParams.toString() ? `?${searchParams.toString()}` : "";
+    const res = await fetch(`${API_BASE}/api/quantum/datasets${query}`);
     return res.json();
   },
 
@@ -658,6 +702,158 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
+  /**
+   * Get/Set offline mode for analysis service
+   */
+  analysisMode: async (mode?: "online" | "offline" | "auto") => {
+    if (mode) {
+      const res = await fetch(`${API_BASE}/api/analysis/mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      return res.json();
+    } else {
+      const res = await fetch(`${API_BASE}/api/analysis/mode`);
+      return res.json();
+    }
+  },
+
+  /**
+   * List offline datasets (via analysis service)
+   */
+  listOfflineDatasetsViaAnalysis: async (params?: { qubit?: string; experiment_type?: string; date?: string }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.qubit) searchParams.set("qubit", params.qubit);
+    if (params?.experiment_type) searchParams.set("experiment_type", params.experiment_type);
+    if (params?.date) searchParams.set("date", params.date);
+    const query = searchParams.toString() ? `?${searchParams.toString()}` : "";
+    const res = await fetch(`${API_BASE}/api/analysis/datasets/offline${query}`);
+    return res.json();
+  },
+
+  /**
+   * Plot offline dataset (from HDF5)
+   */
+  plotOfflineDataset: async (params: { dataset_id: string; command?: string }) => {
+    const res = await fetch(`${API_BASE}/api/analysis/plot/offline`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Plot offline dataset with qter.fitData() style commands (v2)
+   * Supports the same command format as online plotting
+   */
+  plotOfflineDatasetV2: async (params: { dataset_id: string; command?: string }) => {
+    const res = await fetch(`${API_BASE}/api/analysis/plot/offline/v2`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Unified plot API - automatically chooses online/offline based on dataset_id
+   *
+   * @param params.name - Dataset name for online plotting
+   * @param params.path - Path for online plotting
+   * @param params.dataset_id - Dataset ID for offline plotting (HDF5)
+   * @param params.command - Plot command (default: qter.fitData())
+   */
+  plotDataset: async (params: {
+    name?: string;
+    path?: string;
+    dataset_id?: string;
+    command?: string;
+  }) => {
+    // If dataset_id is provided, use offline v2 plotting
+    if (params.dataset_id) {
+      const res = await fetch(`${API_BASE}/api/analysis/plot/offline/v2`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dataset_id: params.dataset_id,
+          command: params.command || "qter.fitData(do_plot=True)",
+        }),
+      });
+      return res.json();
+    }
+
+    // Otherwise use online plotting
+    const res = await fetch(`${API_BASE}/api/analysis/plot/experiments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: params.name,
+        path: params.path,
+        command: params.command,
+      }),
+    });
+    return res.json();
+  },
+
+  // ── Variant Generation API ────────────────────────────────────────────────────
+
+  /**
+   * Get list of supported variant types
+   */
+  getVariantTypes: async () => {
+    const res = await fetch(`${API_BASE}/api/analysis/variants/types`);
+    return res.json();
+  },
+
+  /**
+   * Generate a data variant from source dataset
+   *
+   * @param source_dataset_id - Source dataset ID to generate variant from
+   * @param variant_type - Type of variant (noise_scale, amplitude_drift, etc.)
+   * @param params - Variant parameters
+   * @param seed - Optional random seed for reproducibility
+   */
+  generateVariant: async (params: {
+    source_dataset_id: string;
+    variant_type: string;
+    params?: Record<string, number | string | boolean>;
+    seed?: number;
+  }) => {
+    const res = await fetch(`${API_BASE}/api/analysis/variants/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * List generated variants
+   *
+   * @param source_id - Optional source dataset ID to filter by
+   */
+  listVariants: async (source_id?: string) => {
+    const query = source_id ? `?source_id=${encodeURIComponent(source_id)}` : '';
+    const res = await fetch(`${API_BASE}/api/analysis/variants/list${query}`);
+    return res.json();
+  },
+
+  /**
+   * Plot a generated variant
+   *
+   * @param variant_id - Variant ID to plot
+   */
+  plotVariant: async (variant_id: string) => {
+    const res = await fetch(`${API_BASE}/api/analysis/variants/plot`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ variant_id }),
+    });
+    return res.json();
+  },
+
   runAnalysis: async (command: string, expType?: string) => {
     const r = await fetch(`${API_BASE}/api/experiments/run-analysis`, {
       method: "POST",
@@ -1066,8 +1262,170 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
-  exportSkills: async () => {
-    const res = await fetch(`${API_BASE}/api/skills/export`);
+  // ── QubitClient (VLM Image Analysis) ──────────────────────────────────────
+
+  /**
+   * 获取 QubitClient 健康状态
+   */
+  qubitHealth: async () => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/health`);
+    return res.json();
+  },
+
+  /**
+   * 获取支持的实验类型列表
+   */
+  qubitGetFamilies: async () => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/families`);
+    return res.json();
+  },
+
+  /**
+   * Q1: 描述图表
+   */
+  qubitDescribe: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/describe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Q2: 分类实验结果
+   */
+  qubitClassify: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/classify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Q3: 科学推理
+   */
+  qubitReasoning: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/reasoning`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Q4: 评估拟合
+   */
+  qubitAssessFit: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/assess_fit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Q5: 提取参数
+   */
+  qubitExtractParams: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/extract_params`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * Q6: 评估状态
+   */
+  qubitEvaluate: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/evaluate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  /**
+   * 完整分析 (Q1-Q6)
+   */
+  qubitAnalyzeFull: async (params: { image: string; experiment_family: string; language?: 'en' | 'zh' }) => {
+    const res = await fetch(`${API_BASE}/api/qubitclient/analyze_full`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  // ── QCA (Quantum Calibration Agent) ───────────────────────────────────────
+
+  qcaCapabilities: async () => {
+    const res = await fetch(`${API_BASE}/api/qca/capabilities`);
+    return res.json();
+  },
+
+  qcaSchema: async (name: string) => {
+    const res = await fetch(`${API_BASE}/api/qca/schema/${encodeURIComponent(name)}`);
+    return res.json();
+  },
+
+  qcaRun: async (params: { experiment_name: string; params?: Record<string, unknown>; notes?: string }) => {
+    const res = await fetch(`${API_BASE}/api/qca/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  qcaLab: async (params: {
+    action: string;
+    experiment_name?: string;
+    experiment_id?: string;
+    array_name?: string;
+    last_n?: number;
+    filter_type?: string;
+  }) => {
+    const res = await fetch(`${API_BASE}/api/qca/lab`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    return res.json();
+  },
+
+  qcaHistory: async (last?: number, type?: string) => {
+    const params = new URLSearchParams();
+    if (last) params.append("last", last.toString());
+    if (type) params.append("type", type);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`${API_BASE}/api/qca/history${query}`);
+    return res.json();
+  },
+
+  qcaHistoryDetail: async (id: string) => {
+    const res = await fetch(`${API_BASE}/api/qca/history/${encodeURIComponent(id)}`);
+    return res.json();
+  },
+
+  qcaWorkflows: async () => {
+    const res = await fetch(`${API_BASE}/api/qca/workflows`);
+    return res.json();
+  },
+
+  qcaChat: async (params: { message: string; thread_id?: string }) => {
+    const res = await fetch(`${API_BASE}/api/qca/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
     return res.json();
   },
 };

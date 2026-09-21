@@ -1,0 +1,32 @@
+{
+  "quantum_service": {
+    "enabled": true,
+    "fallback_data_path": "data/fallback/quantum",
+    "offline_mode": {
+      "enabled": true,
+      "data_path": "data/offline_data",
+      "auto_switch_on_disconnect": true,
+      "default_mode": "offline"
+    },
+    "retry": {
+      "max_attempts": 5,
+      "base_delay": 2,
+      "max_delay": 30
+    }
+  },
+  "analysis_service": {
+    "enabled": true,
+    "fallback_data_path": "data/fallback/analysis",
+    "offline_mode": {
+      "enabled": true,
+      "data_path": "data/offline_data",
+      "auto_switch_on_disconnect": true,
+      "default_mode": "offline"
+    },
+    "retry": {
+      "max_attempts": 5,
+      "base_delay": 2,
+      "max_delay": 30
+    }
+  }
+}

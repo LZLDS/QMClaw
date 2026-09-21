@@ -30,6 +30,8 @@ const SERVICES: Record<string, ServiceConfig> = {
   image: { host: 'localhost', port: 3007, defaultTimeout: 300000 },
   workflow: { host: 'localhost', port: 3008, defaultTimeout: 300000 },
   task_queue: { host: 'localhost', port: 3009, defaultTimeout: 30000 },
+  qubitclient: { host: 'localhost', port: 3010, defaultTimeout: 120000 },
+  qca: { host: 'localhost', port: 3011, defaultTimeout: 300000 },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,6 +275,38 @@ export function createServiceProxy() {
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   });
 
+  // ── 离线数据绘图 (新版 - 支持 qter.fitData 风格) ───────────────────────────
+
+  proxy.post('/analysis/plot/offline/v2', async (req, res) => {
+    const result = await proxyToService('analysis', '/plot/offline/v2', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // ── 变体生成 API ───────────────────────────────────────────────────────────────
+
+  proxy.get('/analysis/variants/types', async (_req, res) => {
+    const result = await proxyToService('analysis', '/variants/types', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/analysis/variants/generate', async (req, res) => {
+    const result = await proxyToService('analysis', '/variants/generate', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/analysis/variants/list', async (req, res) => {
+    const query = req.query;
+    const sourceId = query.source_id as string | undefined;
+    const path = sourceId ? `/variants/list?source_id=${encodeURIComponent(sourceId)}` : '/variants/list';
+    const result = await proxyToService('analysis', path, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/analysis/variants/plot', async (req, res) => {
+    const result = await proxyToService('analysis', '/variants/plot', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
   // ── Agent 服务 ─────────────────────────────────────────────────────────────
 
   proxy.post('/agent/chat', async (req, res) => {
@@ -394,6 +428,98 @@ export function createServiceProxy() {
 
   proxy.get('/tasks/stats', async (_req, res) => {
     const result = await proxyToService('task_queue', '/stats', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // ── QubitClient 服务 (VLM 图像分析) ──────────────────────────────────────────
+
+  proxy.get('/qubitclient/health', async (_req, res) => {
+    const result = await proxyToService('qubitclient', '/health', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/qubitclient/families', async (_req, res) => {
+    const result = await proxyToService('qubitclient', '/families', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/describe', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/describe', 'POST', req.body, 180000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/classify', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/classify', 'POST', req.body, 180000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/reasoning', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/reasoning', 'POST', req.body, 180000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/assess_fit', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/assess_fit', 'POST', req.body, 180000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/extract_params', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/extract_params', 'POST', req.body, 180000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/evaluate', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/evaluate', 'POST', req.body, 180000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qubitclient/analyze_full', async (req, res) => {
+    const result = await proxyToService('qubitclient', '/analyze_full', 'POST', req.body, 300000);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // ── QCA 服务 ───────────────────────────────────────────────────────────────
+
+  proxy.get('/qca/capabilities', async (_req, res) => {
+    const result = await proxyToService('qca', '/capabilities', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/qca/schema/:name', async (req, res) => {
+    const result = await proxyToService('qca', `/schema/${req.params.name}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qca/run', async (req, res) => {
+    const result = await proxyToService('qca', '/run', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qca/lab', async (req, res) => {
+    const result = await proxyToService('qca', '/lab', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/qca/history', async (req, res) => {
+    const last = req.query.last ? `?last=${req.query.last}` : '';
+    const type = req.query.type ? `?type=${req.query.type}` : '';
+    const query = last || type ? (last + type) : '';
+    const result = await proxyToService('qca', `/history${query}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/qca/history/:id', async (req, res) => {
+    const result = await proxyToService('qca', `/history/${req.params.id}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/qca/workflows', async (_req, res) => {
+    const result = await proxyToService('qca', '/workflows', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/qca/chat', async (req, res) => {
+    const result = await proxyToService('qca', '/chat', 'POST', req.body);
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   });
 

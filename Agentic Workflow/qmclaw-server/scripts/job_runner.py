@@ -1122,8 +1122,9 @@ def run_workflow_node(node, node_results, workflow_ctx, check_cancel_fn):
                 os.makedirs(_plots_dir, exist_ok=True)
                 _path = os.path.join(_plots_dir, f"wf_{node_id}.png")
                 fig.savefig(_path, dpi=150, bbox_inches="tight")
-                plot_path = _path
-                print(f"QMCLAW_PLOT:{_path}", file=sys.stderr, flush=True)
+                # Use relative URL for browser compatibility
+                plot_path = f"/plots/wf_{node_id}.png"
+                print(f"QMCLAW_PLOT:/plots/wf_{node_id}.png", file=sys.stderr, flush=True)
                 plt.close(fig)
 
             result["status"] = "completed"
@@ -1528,8 +1529,9 @@ def run_workflow_node(node, node_results, workflow_ctx, check_cancel_fn):
                     os.makedirs(_plots_dir, exist_ok=True)
                     _path = os.path.join(_plots_dir, f"wf_{node_id}_exp_{exp_idx}.png")
                     fig.savefig(_path, dpi=150, bbox_inches="tight")
-                    exp_plot_path = _path
-                    print(f"QMCLAW_PLOT:{_path}", file=sys.stderr, flush=True)
+                    # Use relative URL for browser compatibility
+                    exp_plot_path = f"/plots/wf_{node_id}_exp_{exp_idx}.png"
+                    print(f"QMCLAW_PLOT:/plots/wf_{node_id}_exp_{exp_idx}.png", file=sys.stderr, flush=True)
                     plt.close(fig)
 
                 exp_result["plotPath"] = exp_plot_path

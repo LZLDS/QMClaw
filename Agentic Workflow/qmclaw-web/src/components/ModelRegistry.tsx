@@ -18,8 +18,10 @@ interface Props {
 type Tab = 'models' | 'chat' | 'history';
 
 /** Parse thinking tags from MiniMax/M2.7 responses */
-function parseThinkingContent(content: string): { thinking: string | null; answer: string } {
-  // Use string regex to avoid SWC compilation issues with special characters
+function parseThinkingContent(content: string | null | undefined): { thinking: string | null; answer: string } {
+  if (!content) {
+    return { thinking: null, answer: '' };
+  }
   const thinkRegex = new RegExp('<think>([\\s\\S]*?)</think>', '');
   const thinkMatch = content.match(thinkRegex);
   if (thinkMatch) {
@@ -32,7 +34,7 @@ function parseThinkingContent(content: string): { thinking: string | null; answe
 }
 
 /** Render message content with thinking tags styled differently */
-function MessageContent({ content }: { content: string }) {
+function MessageContent({ content }: { content: string | null | undefined }) {
   const { thinking, answer } = parseThinkingContent(content);
 
   return (

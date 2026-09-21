@@ -51,6 +51,11 @@ class LLMService(BaseService):
 
     def _init_providers(self):
         """初始化 Provider 客户端"""
+        # 调试：打印 config 中的值
+        _log(f"DEBUG: minimax_api_key = '{config.get('minimax_api_key')}'")
+        _log(f"DEBUG: openai_api_key = '{config.get('openai_api_key')}'")
+        _log(f"DEBUG: deepseek_api_key = '{config.get('deepseek_api_key')}'")
+
         # MiniMax
         if config.get("minimax_api_key"):
             _log("MiniMax provider available")

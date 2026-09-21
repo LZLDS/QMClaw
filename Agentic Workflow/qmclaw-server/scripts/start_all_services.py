@@ -17,6 +17,25 @@ import threading
 import queue
 from pathlib import Path
 
+# 加载 .env 文件
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent.parent / ".env"
+
+    # 调试：打印加载前的值
+    print(f"[start_all] Before load_dotenv:")
+    print(f"[start_all]   MINIMAX_API_KEY = '{os.environ.get('MINIMAX_API_KEY', '(not set)')}'")
+
+    if env_path.exists():
+        load_dotenv(env_path, override=True)  # 添加 override=True 确保覆盖
+        print(f"[start_all] Loaded .env from {env_path}")
+        print(f"[start_all] After load_dotenv:")
+        print(f"[start_all]   MINIMAX_API_KEY = '{os.environ.get('MINIMAX_API_KEY', '(not set)')}'")
+    else:
+        print(f"[start_all] .env file not found at {env_path}")
+except ImportError:
+    print("[start_all] python-dotenv not installed, .env file will not be loaded")
+
 # 服务配置
 SERVICES = {
     "llm": {
@@ -53,6 +72,21 @@ SERVICES = {
         "port": 3009,
         "script": "services/task_queue/server.py",
         "description": "任务队列服务",
+    },
+    "qubitclient": {
+        "port": 3010,
+        "script": "services/qubitclient_service/server.py",
+        "description": "QubitClient VLM 分析服务",
+    },
+    "qca": {
+        "port": 3011,
+        "script": "services/qca_service/server.py",
+        "description": "QCA 量子校准智能体服务",
+    },
+    "hermes": {
+        "port": 3012,
+        "script": "services/hermes_service/server.py",
+        "description": "Hermes Agent 服务",
     },
 }
 
@@ -110,6 +144,15 @@ def start_service(name: str, config: dict, output_queue: queue.Queue) -> subproc
 
     # 设置环境变量
     env = os.environ.copy()
+
+    # 设置服务端口环境变量
+    env["PORT"] = str(config.get("port", 3000))
+
+    # 调试：打印相关环境变量
+    if name == "llm":
+        print(f"[start_all]   MINIMAX_API_KEY: {'***' if env.get('MINIMAX_API_KEY') else '(not set)'}")
+        print(f"[start_all]   DEEPSEEK_API_KEY: {'***' if env.get('DEEPSEEK_API_KEY') else '(not set)'}")
+        print(f"[start_all]   OPENAI_API_KEY: {'***' if env.get('OPENAI_API_KEY') else '(not set)'}")
 
     print(f"[start_all] Starting {name} ({config['description']})...")
     print(f"[start_all]   Module: {module_path}")
@@ -176,6 +219,7 @@ def wait_for_services(timeout: int = 60):
     """等待所有服务就绪"""
     import urllib.request
     import urllib.error
+    import json
 
     print(f"\n[start_all] Waiting for services to be ready (timeout={timeout}s)...")
 
@@ -184,10 +228,25 @@ def wait_for_services(timeout: int = 60):
 
     # 跟踪每个服务的状态
     service_status = {name: "starting" for name in to_start}
+    # 跟踪是否已经打印过错误信息
+    error_printed = {name: False for name in to_start}
+
+    # Express 网关健康检查 URL
+    express_url = "http://localhost:3002/health"
 
     while time.time() - start_time < timeout:
         all_ready = True
         any_running = False
+
+        # 先检查 Express 网关是否可用
+        express_healthy = False
+        try:
+            req = urllib.request.Request(express_url)
+            with urllib.request.urlopen(req, timeout=2) as response:
+                if response.status == 200:
+                    express_healthy = True
+        except:
+            pass
 
         for name in to_start:
             svc_config = config.get(name, SERVICES.get(name, {}))
@@ -197,41 +256,72 @@ def wait_for_services(timeout: int = 60):
             try:
                 req = urllib.request.Request(url)
                 with urllib.request.urlopen(req, timeout=2) as response:
-                    if response.status == 200:
+                    status_code = response.status
+                    # 接受 200 (healthy) 或 503 (degraded/running) 作为"就绪"
+                    if status_code in (200, 503):
                         if service_status[name] != "ready":
+                            # 根据状态码显示不同信息
+                            if status_code == 200:
+                                print(f"[start_all] ✅ {name}: Ready (port {port})")
+                            else:
+                                print(f"[start_all] ⚠️  {name}: Running in degraded mode (port {port})")
                             service_status[name] = "ready"
-                            print(f"[start_all] ✅ {name}: Ready (port {port})")
                     else:
                         all_ready = False
                         any_running = True
             except urllib.error.URLError as e:
                 all_ready = False
-                if service_status[name] != "error":
-                    # 只打印一次错误
-                    print(f"[start_all] ⏳ {name}: Waiting... ({e.reason})")
+                reason = str(e.reason)
+                # 检测是否是熔断器导致的错误
+                if "Service unavailable" in reason or "Circuit open" in reason:
+                    if not error_printed[name]:
+                        print(f"[start_all] ⏳ {name}: Circuit breaker open (Express gateway cannot reach service)")
+                        error_printed[name] = True
+                    service_status[name] = "circuit_open"
+                else:
+                    if service_status[name] != "error":
+                        print(f"[start_all] ⏳ {name}: Waiting... ({reason})")
+                        error_printed[name] = True
                     service_status[name] = "waiting"
             except Exception as e:
                 all_ready = False
                 if service_status[name] != "error":
                     print(f"[start_all] ⏳ {name}: Waiting... ({type(e).__name__})")
-                    service_status[name] = "waiting"
+                    error_printed[name] = True
+                service_status[name] = "waiting"
 
-        if all_ready and any_running:
+        # 检查是否可以认为服务已就绪
+        # 如果所有服务要么已就绪，要么被熔断器阻止（服务本身在运行），则认为成功
+        non_waiting = [name for name, status in service_status.items()
+                       if status in ("ready", "circuit_open")]
+        if len(non_waiting) == len(to_start) and any_running:
             elapsed = time.time() - start_time
-            print(f"[start_all] All services ready! (took {elapsed:.1f}s)")
+            circuit_open = [name for name, status in service_status.items() if status == "circuit_open"]
+            if circuit_open:
+                print(f"[start_all] Services ready (circuit breakers will auto-recover in ~30s): {', '.join(circuit_open)}")
+            print(f"[start_all] All services started! (took {elapsed:.1f}s)")
             return True
 
-        if not any_running:
-            # 至少有一个服务在运行
-            pass
+        # 如果 Express 网关不可用，给出提示
+        if not express_healthy:
+            print(f"[start_all] ⚠️  Express gateway (port 3002) not healthy - services may report false failures")
 
         time.sleep(1)
 
-    # 超时时显示哪些服务未就绪
-    print("[start_all] ⚠️  Timeout waiting for services")
+    # 超时时显示哪些服务未就绪，并给出诊断建议
+    print("\n[start_all] ⚠️  Timeout waiting for services")
     print("[start_all] Service status:")
     for name, status in service_status.items():
-        print(f"  - {name}: {status}")
+        status_icon = "✅" if status == "ready" else "⏳" if status == "waiting" else "🔌"
+        print(f"  {status_icon} {name}: {status}")
+
+    # 给出诊断建议
+    circuit_open_services = [name for name, status in service_status.items() if status == "circuit_open"]
+    if circuit_open_services:
+        print(f"\n[start_all] 💡 Tip: Circuit breaker is open for: {', '.join(circuit_open_services)}")
+        print("[start_all]    This usually means Express gateway had previous failures.")
+        print("[start_all]    The circuit will auto-recover in 30 seconds, or restart Express gateway.")
+
     return False
 
 

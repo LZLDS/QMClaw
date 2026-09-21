@@ -8,7 +8,7 @@
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { api, Metrics, ExperimentConfig } from "../lib/api";
+import { api, Metrics, ExperimentConfig, normalizePlotUrl } from "../lib/api";
 import CollapsibleCommand from "../components/CollapsibleCommand";
 import UnifiedResults from "../components/UnifiedResults";
 import JobsPanel from "../components/JobsPanel";
@@ -23,6 +23,9 @@ import ExperimentConfigs from "../components/ExperimentConfigs";
 import { useModelStore } from "../store/modelStore";
 import ChatHistorySidebar from "../components/ChatHistorySidebar";
 import WorkflowHistorySidebar from "../components/WorkflowHistorySidebar";
+import QCATab from "../components/QCATab";
+import ImageAnalysisTab from "../components/tabs/ImageAnalysisTab";
+import VariantGenerator from "../components/VariantGenerator";
 
 // Plots directory (must match Express server)
 // Uses relative path from project root, or PLOTS_DIR env var
@@ -53,7 +56,8 @@ function StatusDot({ label, status }: { label: string; status: string }) {
 
 async function checkHealth(
   setServerOk: (v: boolean) => void,
-  setQuickStatus: (s: QuickStatus | null) => void
+  setQuickStatus: (s: QuickStatus | null) => void,
+  onOfflineStatus?: (mode: string, available: boolean) => void
 ) {
   try {
     const health = await api.ping() as {
@@ -67,9 +71,21 @@ async function checkHealth(
     } catch {
       setQuickStatus(null);
     }
+    // Fetch quantum service mode status
+    if (onOfflineStatus) {
+      try {
+        const modeResult = await api.quantumMode() as { mode?: string; offline_available?: boolean };
+        onOfflineStatus(modeResult.mode || "auto", modeResult.offline_available || false);
+      } catch {
+        onOfflineStatus("auto", false);
+      }
+    }
   } catch {
     setServerOk(false);
     setQuickStatus(null);
+    if (onOfflineStatus) {
+      onOfflineStatus("auto", false);
+    }
   }
 }
 
@@ -106,8 +122,8 @@ function saveArray(key: string, value: string[]) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-// Tab: experiments, workflow, agent, images, hermes
-type Tab = "experiments" | "workflow" | "agent" | "images" | "hermes";
+// Tab: experiments, workflow, agent, images, hermes, qca, image_analysis
+type Tab = "experiments" | "workflow" | "agent" | "images" | "hermes" | "qca" | "image_analysis";
 type ExpType = "spectroscopy" | "s21" | "iqraw" | "t1" | "xeb" | "ramsey" | "piamp" | "s21_dis" | "allxy" | "single_shot" | "pulsed_spec" | "swap" | "drag_calibrate";
 
 // ── Default values (used for SSR and fallback) ────────────────────────────────
@@ -141,6 +157,10 @@ export default function Dashboard() {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
 
+  // Offline mode state
+  const [quantumMode, setQuantumMode] = useState<"online" | "offline" | "auto">("auto");
+  const [offlineAvailable, setOfflineAvailable] = useState(false);
+
   // Qubit list — persisted (SSR uses defaults, client hydrates from localStorage)
   const [qubits, setQubits] = useState<string[]>(defaultQubits);
   const [selectedQubit, setSelectedQubitState] = useState<string>(defaultSelectedQubit);
@@ -156,6 +176,14 @@ export default function Dashboard() {
 
   // Experiment configs modal
   const [showExperimentConfigs, setShowExperimentConfigs] = useState(false);
+
+  // Variant generator modal
+  const [variantSourceDataset, setVariantSourceDataset] = useState<{
+    id: string;
+    name: string;
+    qubit?: string;
+    experiment_type?: string;
+  } | null>(null);
 
   // Experiment configs loaded from backend
   const [experimentConfigs, setExperimentConfigs] = useState<Record<string, {
@@ -256,17 +284,19 @@ export default function Dashboard() {
       const result = await api.listQubits() as {
         qubits: Array<{ name: string; f10?: number; fread?: number; bias_z?: number }>;
         sessionPath: string[];
+        source?: string;
       };
       if (result.qubits && result.qubits.length > 0) {
         const qubitNames = result.qubits.map(q => q.name);
         setQubits(qubitNames);
         // Auto-select first qubit if current selection is not in list
         setSelectedQubitState(prev => qubitNames.includes(prev) ? prev : qubitNames[0]);
-        addLog(`Loaded ${qubitNames.length} qubits${result.sessionPath ? ' from session: ' + result.sessionPath.join('/') : ''}`);
+        const source = result.source || (offlineAvailable ? "offline" : "live");
+        addLog(`Loaded ${qubitNames.length} qubits (${source})${result.sessionPath ? ' from session: ' + result.sessionPath.join('/') : ''}`);
       } else {
         setQubits([]);
         setSelectedQubitState("");
-        addLog("No qubits found in current session", true);
+        addLog("No qubits found", true);
       }
     } catch (e: any) {
       addLog(`Failed to load qubits: ${e.message}`, true);
@@ -296,13 +326,20 @@ export default function Dashboard() {
   }, [logs]);
 
   useEffect(() => {
-    checkHealth(setServerOk, setQuickStatus);
-    const interval = setInterval(() => checkHealth(setServerOk, setQuickStatus), 30_000);
+    checkHealth(setServerOk, setQuickStatus, (mode, available) => {
+      setQuantumMode(mode as "online" | "offline" | "auto");
+      setOfflineAvailable(available);
+    });
+    const interval = setInterval(() => checkHealth(setServerOk, setQuickStatus, (mode, available) => {
+      setQuantumMode(mode as "online" | "offline" | "auto");
+      setOfflineAvailable(available);
+    }), 30_000);
     return () => clearInterval(interval);
   }, []);
 
   // ── Plot historical dataset from DataVault ──────────────────────────────
-  const handlePlotHistoricalDataset = async (name: string, path: string) => {
+  // Unified handler for both online and offline datasets
+  const handlePlotHistoricalDataset = async (params: { name?: string; path?: string; dataset_id?: string }) => {
     if (running) {
       addLog("⚠️ Cannot plot while experiment is running", true);
       return;
@@ -315,18 +352,38 @@ export default function Dashboard() {
     setAnalysisError(null);
     setPlotAnalysisOutput(null);
     setLlmSummary(null);
-    addLog(`📊 Plotting historical dataset: ${name}...`);
 
     try {
-      // 使用新版 API - 自动根据实验类型选择绘图配置
-      const result = await api.plotExperimentDataset(name, path);
+      let result: any;
 
-      if (result.success && result.image) {
-        // 直接使用 Base64 URL 显示图像
-        setPlotUrl(result.image);
-        addLog(`✅ Plotted ${result.exp_type} for qubit ${result.qubit} (exp #${result.exp_num})`);
+      if (params.dataset_id) {
+        // Offline dataset - use v2 API
+        addLog(`📊 Plotting offline dataset: ${params.dataset_id}...`);
+        result = await api.plotOfflineDatasetV2({
+          dataset_id: params.dataset_id,
+          command: currentPlotCommand || "qter.fitData(do_plot=True)"
+        });
+
+        if (result.success && result.image) {
+          setPlotUrl(result.image);
+          addLog(`✅ Plotted offline: ${result.qubit || 'unknown'} - ${result.experiment_type || 'unknown'}`);
+        } else {
+          addLog(`❌ Plot failed: ${result.error || "Unknown error"}`, true);
+        }
+      } else if (params.name && params.path) {
+        // Online dataset - use original API
+        addLog(`📊 Plotting historical dataset: ${params.name}...`);
+        result = await api.plotExperimentDataset(params.name, params.path);
+
+        if (result.success && result.image) {
+          // 直接使用 Base64 URL 显示图像
+          setPlotUrl(result.image);
+          addLog(`✅ Plotted ${result.exp_type} for qubit ${result.qubit} (exp #${result.exp_num})`);
+        } else {
+          addLog(`❌ Plot failed: ${result.error || "Unknown error"}`, true);
+        }
       } else {
-        addLog(`❌ Plot failed: ${result.error || "Unknown error"}`, true);
+        addLog("❌ Invalid plot parameters", true);
       }
     } catch (e: any) {
       addLog(`❌ ${e.message}`, true);
@@ -337,15 +394,50 @@ export default function Dashboard() {
     }
   };
 
-  // Listen for "plot in experiments" event from DatasetBrowser
+  // Listen for "plot in experiments" event from DatasetBrowser (online datasets)
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as { name: string; path: string };
-      handlePlotHistoricalDataset(detail.name, detail.path);
+      handlePlotHistoricalDataset({ name: detail.name, path: detail.path });
     };
     window.addEventListener("dataset:plot-in-experiments", handler);
     return () => window.removeEventListener("dataset:plot-in-experiments", handler);
   }, [currentPlotCommand, running]);
+
+  // Listen for "plot offline dataset" event from JobsPanel
+  // The event contains the Base64 image directly, no need to re-fetch
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { dataset_id: string; image?: string };
+      if (detail.image) {
+        // Image is already in the event, display directly
+        setPlotUrl(detail.image);
+        addLog(`✅ Plotted offline dataset: ${detail.dataset_id}`);
+      }
+    };
+    window.addEventListener("dataset:plot-offline", handler);
+    return () => window.removeEventListener("dataset:plot-offline", handler);
+  }, []);
+
+  // Listen for "open variant generator" event from JobsPanel
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        dataset_id: string;
+        name: string;
+        qubit?: string;
+        experiment_type?: string;
+      };
+      setVariantSourceDataset({
+        id: detail.dataset_id,
+        name: detail.name,
+        qubit: detail.qubit,
+        experiment_type: detail.experiment_type,
+      });
+    };
+    window.addEventListener("dataset:open-variant-generator", handler);
+    return () => window.removeEventListener("dataset:open-variant-generator", handler);
+  }, []);
 
   // ── Persistence wrappers ────────────────────────────────────────────────
   const setSelectedQubit = (q: string) => {
@@ -358,9 +450,10 @@ export default function Dashboard() {
     saveStr(STORAGE_KEYS.selectedExp, e);
     // Update commands from configs
     if (experimentConfigs[e]) {
-      setCurrentRunCommand(experimentConfigs[e].defaultCommand || "");
-      setCurrentPlotCommand(experimentConfigs[e].defaultPlotCommand || "");
-      setCurrentAnalyzeCommand(experimentConfigs[e].defaultAnalysisCommand || "");
+      const cfg = experimentConfigs[e];
+      setCurrentRunCommand(cfg.function ? `${cfg.function}({qubit}, do_plot=True)` : "");
+      setCurrentPlotCommand(cfg.defaultPlotCommand || "");
+      setCurrentAnalyzeCommand(cfg.defaultAnalysisCommand || "");
     }
   };
 
@@ -434,6 +527,46 @@ export default function Dashboard() {
       // Use synchronous microservice endpoint
       const result = await api.runExperiment(code, { timeout: 300 });
       setTaskId(result.task_id);
+
+      // Check for offline mode error
+      if (result.status === "offline") {
+        addLog("⚠️ Offline mode: " + (result.error || "Cannot execute experiment"), true);
+        setRunning(false);
+        setIsRunningCommand(false);
+        setPlotLoading(false);
+        return;
+      }
+
+      // Handle offline simulation results
+      if (result.status === "offline_simulated") {
+        addLog("🔬 [OFFLINE SIM] " + exp + " on " + selectedQubit);
+        addLog("   " + (result.stdout || "").split("\n")[0]);
+
+        // Parse analysis from stdout
+        const analysisMatch = (result.stdout || "").match(/QMCLAW_ANALYSIS:(.+)/);
+        if (analysisMatch) {
+          try {
+            const analysis = JSON.parse(analysisMatch[1]);
+            setAnalysisResult({ success: true, stdout: analysis });
+            addLog("📊 Analysis: " + JSON.stringify(analysis).slice(0, 100) + "...");
+          } catch {
+            setAnalysisResult({ success: true, stdout: analysisMatch[1] });
+            addLog("📊 Analysis: " + analysisMatch[1].slice(0, 100) + "...");
+          }
+        }
+
+        // Show plot if available
+        if (result.plotPath) {
+          setPlotUrl(normalizePlotUrl(result.plotPath));
+          addLog("📊 Plot generated from historical data");
+        }
+
+        setRunning(false);
+        setIsRunningCommand(false);
+        setPlotLoading(false);
+        return;
+      }
+
       addLog("Task: " + result.task_id.slice(0, 12) + "...");
 
       if (result.status === "success") {
@@ -441,7 +574,7 @@ export default function Dashboard() {
         const snippet = (result.stdout || "").slice(-200).replace(/\n/g, " | ");
         addLog("  → " + snippet);
         if (result.result && typeof result.result === 'object' && 'plotPath' in result.result) {
-          setPlotUrl(result.result.plotPath as string);
+          setPlotUrl(normalizePlotUrl(result.result.plotPath as string));
         }
 
         // Parse analysis result from stdout
@@ -505,7 +638,7 @@ export default function Dashboard() {
         const snippet = (result.stdout || "").slice(-200).replace(/\n/g, " | ");
         addLog("  → " + snippet);
         if (result.result && typeof result.result === 'object' && 'plotPath' in result.result) {
-          setPlotUrl(result.result.plotPath as string);
+          setPlotUrl(normalizePlotUrl(result.result.plotPath as string));
         }
 
         // Parse analysis result from stdout
@@ -742,6 +875,35 @@ export default function Dashboard() {
               <StatusDot label="DataVault" status={quickStatus.datavault} />
             </div>
           )}
+          {/* Offline mode selector */}
+          <select
+            value={quantumMode}
+            onChange={async (e) => {
+              const newMode = e.target.value as "online" | "offline" | "auto";
+              setQuantumMode(newMode);
+              try {
+                await api.quantumMode(newMode);
+                addLog(`Mode changed to: ${newMode}`);
+              } catch (err: any) {
+                addLog(`Failed to change mode: ${err.message}`, true);
+              }
+            }}
+            style={{
+              padding: "0.2rem 0.5rem",
+              background: quantumMode === "offline" ? "#92400e" : quantumMode === "online" ? "#1e40af" : "#374151",
+              border: "1px solid #4b5563",
+              borderRadius: "0.375rem",
+              color: "#e2e8f0",
+              cursor: "pointer",
+              fontSize: "0.7rem",
+              fontWeight: 600,
+            }}
+            title={offlineAvailable ? "Offline data available" : "Enable offline mode"}
+          >
+            <option value="auto">🔄 Auto</option>
+            <option value="online">🌐 Online</option>
+            <option value="offline">📦 Offline {offlineAvailable ? "✓" : ""}</option>
+          </select>
           {/* Model Registry button */}
           <button
             onClick={() => setShowModelRegistry(true)}
@@ -966,7 +1128,7 @@ export default function Dashboard() {
 
           {/* Tab bar */}
           <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0 }}>
-            {(["experiments", "workflow", "agent", "images", "hermes"] as Tab[]).map((t) => (
+            {(["experiments", "workflow", "agent", "images", "hermes", "qca", "image_analysis"] as Tab[]).map((t) => (
               <button key={t} onClick={() => setActiveTab(t)} style={{
                 padding: "0.4rem 1rem", borderRadius: "0.375rem", border: "none",
                 background: activeTab === t ? "#38bdf8" : "#1e293b",
@@ -1226,6 +1388,31 @@ export default function Dashboard() {
                   />
                   🤖 LLM
                 </label>
+
+                {/* Variant Generator Button */}
+                <button
+                  onClick={() => {
+                    if (plotUrl) {
+                      // Open variant generator for the current dataset
+                      // For now, we'll use a placeholder - in a real implementation,
+                      // we'd get the dataset info from the current plot
+                      addLog("💡 Variant generator: select a dataset first");
+                    }
+                  }}
+                  style={{
+                    padding: "0.4rem 0.75rem",
+                    background: "#1e293b",
+                    border: "1px solid #6366f1",
+                    borderRadius: "0.375rem",
+                    color: "#a78bfa",
+                    cursor: "pointer",
+                    fontSize: "0.75rem",
+                    fontWeight: 600,
+                  }}
+                  title="Generate data variants from current dataset"
+                >
+                  🔬 变体
+                </button>
               </div>
 
               {/* Unified Results Display */}
@@ -1269,6 +1456,16 @@ export default function Dashboard() {
           {/* HERMES TAB */}
           {activeTab === "hermes" && (
             <HermesChatPanel />
+          )}
+
+          {/* QCA TAB */}
+          {activeTab === "qca" && (
+            <QCATab />
+          )}
+
+          {/* IMAGE ANALYSIS TAB */}
+          {activeTab === "image_analysis" && (
+            <ImageAnalysisTab />
           )}
 
         </main>
@@ -1327,6 +1524,17 @@ export default function Dashboard() {
       {/* Experiment Configs Modal */}
       {showExperimentConfigs && (
         <ExperimentConfigs onClose={() => setShowExperimentConfigs(false)} />
+      )}
+
+      {/* Variant Generator Modal */}
+      {variantSourceDataset && (
+        <VariantGenerator
+          sourceDataset={variantSourceDataset}
+          onClose={() => setVariantSourceDataset(null)}
+          onPlotVariant={(variantId) => {
+            addLog(`📊 Plotted variant: ${variantId}`);
+          }}
+        />
       )}
     </div>
   );

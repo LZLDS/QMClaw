@@ -17,6 +17,8 @@ Agentic Workflow/qmclaw-server/config/memory/skills/
 CLAUDE.md
 build/
 dist/
+offline_data/
+Agentic Workflow/qmclaw-server/config/qubitclient.json
 
 # Environment (secrets)
 .env

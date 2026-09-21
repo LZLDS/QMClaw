@@ -13,10 +13,13 @@ import time
 import threading
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
-from ..common import setup_logging, config
+from ..common import setup_logging, config, FallbackManager, ConnectionState
+from ..common.offline_data_provider import OfflineDataProvider
+from .offline_simulator import ExperimentSimulator
 
 
 def _log(msg: str):
@@ -32,7 +35,14 @@ class QuantumService(BaseService):
     - 实验代码执行（带 busy 锁，防止并发）
     - Qubit 参数查询
     - Session 切换
+    - 离线模式支持
     """
+
+    # 运行模式枚举
+    class Mode:
+        ONLINE = "online"      # 强制使用 LabRAD
+        OFFLINE = "offline"    # 强制使用离线数据
+        AUTO = "auto"          # 自动切换（LabRAD断开时自动离线）
 
     def __init__(self, port: int = 3003):
         cfg = ServiceConfig(
@@ -57,6 +67,39 @@ class QuantumService(BaseService):
         # 初始化状态
         self._init_started = False
 
+        # 降级模式管理
+        config_path = Path(__file__).parent.parent.parent / "config" / "fallback_config.json"
+        fb_config = FallbackManager.load_fallback_config(config_path).get("quantum_service", {})
+        self._fallback = FallbackManager(
+            service_name="quantum_service",
+            config_path=config_path,
+            fallback_data_path=fb_config.get("fallback_data_path", "data/fallback/quantum"),
+            max_retry_attempts=fb_config.get("retry", {}).get("max_attempts", 5),
+            base_retry_delay=fb_config.get("retry", {}).get("base_delay", 2),
+            max_retry_delay=fb_config.get("retry", {}).get("max_delay", 30),
+        )
+
+        # 降级模式下的缓存数据
+        self._fallback_qubits: List[Dict[str, Any]] = []
+        self._fallback_experiments: List[Dict[str, Any]] = []
+
+        # 离线模式管理
+        offline_config = fb_config.get("offline_mode", {})
+        self._offline_mode_enabled = offline_config.get("enabled", True)
+        self._offline_data_path = offline_config.get("data_path", "data/offline_data")
+        self._offline_auto_switch = offline_config.get("auto_switch_on_disconnect", True)
+
+        # 运行模式：online/offline/auto，从配置读取默认值
+        default_mode = offline_config.get("default_mode", "auto")
+        self._mode = default_mode if default_mode in (self.Mode.ONLINE, self.Mode.OFFLINE, self.Mode.AUTO) else self.Mode.AUTO
+        self._mode_lock = threading.Lock()
+
+        # 离线数据提供器
+        self._offline_provider: Optional[OfflineDataProvider] = None
+
+        # 实验模拟器（离线模式使用）
+        self._simulator: Optional[ExperimentSimulator] = None
+
     def _is_busy(self) -> bool:
         """检查是否正在执行任务"""
         return self._busy.is_set()
@@ -77,8 +120,23 @@ class QuantumService(BaseService):
             self._current_task_id = None
 
     def before_start(self):
-        """启动时初始化 - 同步完成 LabRAD 连接"""
+        """启动时初始化 - LabRAD 连接失败时进入降级模式"""
         _log("Initializing Quantum service...")
+
+        # 加载降级数据
+        self._load_fallback_data()
+
+        # 初始化离线数据提供器
+        self._init_offline_provider()
+
+        # 打印当前模式
+        _log(f"Mode: {self._get_mode()}")
+
+        # 离线模式下跳过 LabRAD 连接尝试
+        if self._is_offline_mode:
+            _log("Offline mode: skipping LabRAD connection")
+            self._fallback.set_state(ConnectionState.DEGRADED_PERMANENT)
+            return
 
         # 延迟导入避免启动时卡住
         try:
@@ -88,22 +146,253 @@ class QuantumService(BaseService):
 
             # 启动时同步连接 LabRAD
             _log("Connecting to LabRAD...")
+            self._fallback.set_state(ConnectionState.CONNECTING)
             success = self._labrad.initialize()
             if success:
                 _log("LabRAD connected successfully")
                 self._init_started = True
+                self._fallback.on_connection_success()
             else:
                 _log(f"LabRAD connection failed: {self._labrad._init_error}")
                 self._init_started = False
-                # 连接失败时抛出异常，让服务启动失败
-                raise Exception(f"Failed to connect to LabRAD: {self._labrad._init_error}")
+                self._fallback.on_connection_failed(self._labrad._init_error)
+                # 不抛出异常，而是进入降级模式并启动重连
+                self._fallback.start_reconnect_timer(self._do_reconnect)
 
         except Exception as e:
             _log(f"Failed to initialize Quantum service: {e}")
-            raise
+            self._init_started = False
+            self._fallback.on_connection_failed(str(e))
+            self._fallback.start_reconnect_timer(self._do_reconnect)
+
+    def _do_reconnect(self) -> bool:
+        """执行重连"""
+        # 离线模式或自动模式下 LabRAD 不可用时，跳过重连
+        # 只有在强制在线模式(ONLINE)时才继续重连
+        with self._mode_lock:
+            if self._mode == self.Mode.OFFLINE:
+                _log("Skipping reconnect: offline mode enabled")
+                self._fallback._cancel_retry_timer()
+                return False
+            if self._mode == self.Mode.AUTO and not self._labrad:
+                # AUTO 模式下且从未成功连接过，跳过重连
+                _log("Skipping reconnect: auto mode, no previous successful connection")
+                self._fallback._cancel_retry_timer()
+                return False
+
+        if self._labrad is None:
+            try:
+                from .labrad_client import LabRADClient
+                self._labrad = LabRADClient()
+            except Exception as e:
+                self._fallback._last_error = str(e)
+                return False
+
+        try:
+            success = self._labrad.initialize()
+            if success:
+                self._init_started = True
+                self._load_fallback_data()  # 刷新缓存
+                return True
+            else:
+                self._fallback._last_error = self._labrad._init_error
+                return False
+        except Exception as e:
+            self._fallback._last_error = str(e)
+            return False
+
+    def _load_fallback_data(self):
+        """加载降级数据"""
+        try:
+            qubits_data = self._fallback.get_fallback_data("qubits.json")
+            if qubits_data:
+                self._fallback_qubits = qubits_data if isinstance(qubits_data, list) else []
+                _log(f"Loaded {len(self._fallback_qubits)} fallback qubits")
+
+            experiments_data = self._fallback.get_fallback_data("experiments.json")
+            if experiments_data:
+                self._fallback_experiments = experiments_data if isinstance(experiments_data, list) else []
+                _log(f"Loaded {len(self._fallback_experiments)} fallback experiments")
+        except Exception as e:
+            _log(f"Failed to load fallback data: {e}")
+
+    def _init_offline_provider(self):
+        """初始化离线数据提供器和实验模拟器"""
+        if not self._offline_mode_enabled:
+            _log("Offline mode is disabled")
+            return
+
+        try:
+            # 解析离线数据路径
+            offline_path = Path(__file__).parent.parent.parent / self._offline_data_path
+            self._offline_provider = OfflineDataProvider(str(offline_path))
+
+            if self._offline_provider.load():
+                summary = self._offline_provider.get_summary()
+                _log(f"Offline data loaded: {summary['total_datasets']} datasets, {summary['total_qubits']} qubits")
+
+                # 初始化实验模拟器
+                self._simulator = ExperimentSimulator(self._offline_provider)
+                _log("Experiment simulator initialized")
+            else:
+                _log(f"Failed to load offline data from {offline_path}")
+                self._offline_provider = None
+        except Exception as e:
+            _log(f"Failed to initialize offline provider: {e}")
+            self._offline_provider = None
+
+    @property
+    def _is_offline_mode(self) -> bool:
+        """检查是否处于离线模式"""
+        with self._mode_lock:
+            if self._mode == self.Mode.OFFLINE:
+                return True
+            if self._mode == self.Mode.ONLINE:
+                return False
+            # AUTO 模式：LabRAD 不可用时自动离线
+            return not self._ensure_connected()
+
+    def _set_mode(self, mode: str) -> bool:
+        """设置运行模式
+
+        Args:
+            mode: "online", "offline", 或 "auto"
+
+        Returns:
+            是否设置成功
+        """
+        if mode not in (self.Mode.ONLINE, self.Mode.OFFLINE, self.Mode.AUTO):
+            return False
+
+        with self._mode_lock:
+            old_mode = self._mode
+            self._mode = mode
+            _log(f"Mode changed: {old_mode} -> {mode}")
+        return True
+
+    def _get_mode(self) -> str:
+        """获取当前运行模式"""
+        with self._mode_lock:
+            return self._mode
+
+    def _execute_offline_simulation(self, code: str, task_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        离线模式模拟执行
+
+        策略:
+        1. 检查模拟器是否可用
+        2. 解析实验类型和 qubit
+        3. 查找匹配的离线数据
+        4. 生成模拟输出
+        """
+        # 检查模拟器是否可用
+        if self._simulator is None:
+            return {
+                "task_id": task_id,
+                "status": "offline_no_simulator",
+                "stdout": "[OFFLINE] Simulator not available",
+                "stderr": "",
+                "error": "实验模拟器未初始化",
+            }
+
+        _log(f"[OFFLINE SIM] Task: {task_id}")
+        _log(f"[OFFLINE SIM] Code: {code[:100]}...")
+
+        try:
+            # 执行模拟
+            result = self._simulator.simulate(code)
+
+            # 添加任务 ID
+            result["task_id"] = task_id
+
+            # 添加绘图路径（如果有数据）
+            if result.get("data"):
+                plot_path = self._generate_simulation_plot(result)
+                if plot_path:
+                    result["plotPath"] = plot_path
+
+            _log(f"[OFFLINE SIM] Result: status={result.get('status')}, "
+                 f"exp_type={result.get('exp_type')}, "
+                 f"qubit={result.get('qubit')}")
+
+            return result
+
+        except Exception as e:
+            _log(f"[OFFLINE SIM] Error: {e}\n{traceback.format_exc()}")
+            return {
+                "task_id": task_id,
+                "status": "offline_simulated",
+                "stdout": f"[OFFLINE SIMULATION] Error: {str(e)}",
+                "stderr": traceback.format_exc(),
+                "error": str(e),
+                "simulated": True,
+            }
+
+    def _generate_simulation_plot(self, result: Dict[str, Any]) -> Optional[str]:
+        """生成模拟实验的绘图"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from io import BytesIO
+            import base64
+
+            plot_data = result.get("data")
+            if not plot_data:
+                return None
+
+            # 确定保存路径
+            _qmclaw_server_dir = Path(__file__).parent.parent.parent
+            plots_dir = _qmclaw_server_dir.parent / "qmclaw-web" / "public" / "plots"
+            plots_dir.mkdir(parents=True, exist_ok=True)
+
+            # 创建图表
+            plt.close('all')
+            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+            data_type = plot_data.get("type", "line")
+
+            if data_type == "line":
+                x = plot_data.get("x", [])
+                y = plot_data.get("y", [])
+                if x and y:
+                    ax.plot(x, y, 'b.-', markersize=3)
+
+            elif data_type == "scatter":
+                x = plot_data.get("x", [])
+                y = plot_data.get("y", [])
+                if x and y:
+                    ax.scatter(x, y, alpha=0.5, s=10)
+
+            # 设置标签
+            ax.set_xlabel(plot_data.get("xlabel", "X"))
+            ax.set_ylabel(plot_data.get("ylabel", "Y"))
+            ax.set_title(plot_data.get("title", f"{result.get('exp_type', 'Unknown')} (Offline Sim)"))
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+            # 保存
+            filename = f"offline_sim_{result.get('exp_type', 'unknown')}_{int(time.time() * 1000)}.png"
+            plot_path = plots_dir / filename
+            fig.savefig(str(plot_path), dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            # 返回相对 URL 路径，而不是绝对文件路径
+            # 前端通过 Express 服务器访问 /plots/ 路径
+            return f"/plots/{filename}"
+
+        except Exception as e:
+            _log(f"[OFFLINE SIM] Plot error: {e}")
+            return None
 
     def _ensure_connected(self) -> bool:
-        """确保 LabRAD 已连接"""
+        """确保 LabRAD 已连接
+
+        在降级模式下直接返回 False。
+        """
+        if self._fallback.is_permanently_degraded:
+            return False
+
         if self._labrad is None:
             return False
 
@@ -115,8 +404,10 @@ class QuantumService(BaseService):
         success = self._labrad.initialize()
         if success:
             _log("LabRAD connected successfully")
+            self._fallback.on_connection_success()
         else:
             _log(f"LabRAD connection failed: {self._labrad._init_error}")
+            self._fallback.on_connection_failed(self._labrad._init_error)
 
         return success
 
@@ -147,6 +438,8 @@ class QuantumService(BaseService):
             return self._handle_qubit_params(data)
         elif path == "/qubit/set_params":
             return self._handle_qubit_set_params(data)
+        elif path == "/mode":
+            return self._handle_mode(data)
         elif path == "/datasets":
             return self._handle_datasets(data)
         else:
@@ -155,18 +448,58 @@ class QuantumService(BaseService):
     def _handle_health(self) -> Dict[str, Any]:
         """健康检查"""
         labrad_ok = self._labrad is not None and self._labrad.connected
+        fallback_info = self._fallback.get_status_info()
         return {
             "status": "healthy" if labrad_ok else "degraded",
             "service": "quantum_service",
             "labrad_connected": labrad_ok,
+            "fallback_mode": self._fallback.is_degraded,
+            "fallback_state": fallback_info["state"],
+            "fallback_message": self._get_fallback_message(),
             "ready": not self._busy.is_set(),
             "busy": self._busy.is_set(),
             "current_task": self._current_task_id,
             "running_tasks": len(self._running_tasks),
+            "mode": self._get_mode(),
+            "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
         }
 
+    def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """处理模式切换请求"""
+        # GET 请求（无 mode 参数）返回当前状态
+        if "mode" not in data:
+            return {
+                "success": True,
+                "mode": self._get_mode(),
+                "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            }
+
+        mode = data["mode"]
+        if not self._set_mode(mode):
+            return {
+                "success": False,
+                "error": f"Invalid mode: {mode}",
+                "current_mode": self._get_mode(),
+            }
+
+        return {
+            "success": True,
+            "mode": self._get_mode(),
+            "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+        }
+
+    def _get_fallback_message(self) -> str:
+        """获取降级模式提示信息"""
+        if self._fallback.is_connected:
+            return ""
+        if self._fallback.is_permanently_degraded:
+            return f"LabRAD 不可用（已停止重连）。最后错误：{self._fallback.last_error or '未知错误'}"
+        if self._fallback.is_degraded:
+            return f"LabRAD 连接中断，正在尝试重连（{self._fallback.retry_count}/{self._fallback._max_retry_attempts}）..."
+        return "LabRAD 未连接"
+
     def _handle_connect(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """手动触发连接"""
+        """手动触发连接或重连"""
         session_path = data.get("session_path")
         if session_path:
             if isinstance(session_path, str):
@@ -175,12 +508,33 @@ class QuantumService(BaseService):
         timeout = data.get("timeout", 60)
 
         with self._labrad_lock:
+            # 如果已经连接且用户没有指定新路径，直接返回成功
+            if self._labrad is not None and self._labrad.connected and session_path is None:
+                return {
+                    "success": True,
+                    "message": "Already connected to LabRAD",
+                    "session_path": self._labrad.session_path,
+                    "qubit_count": len(self._labrad.qubits),
+                }
+
+            # 手动重连（重置重试计数）
             if self._labrad is None:
-                return {"success": False, "error": "LabRAD client not initialized"}
+                try:
+                    from .labrad_client import LabRADClient
+                    self._labrad = LabRADClient()
+                except Exception as e:
+                    return {"success": False, "error": f"Failed to create LabRAD client: {e}"}
+
+            # 重置降级状态
+            self._fallback.reset()
+            self._fallback.set_state(ConnectionState.CONNECTING)
 
             success = self._labrad.initialize(session_path, timeout)
 
             if success:
+                self._init_started = True
+                self._fallback.on_connection_success()
+                self._load_fallback_data()
                 return {
                     "success": True,
                     "message": "Connected to LabRAD",
@@ -188,63 +542,237 @@ class QuantumService(BaseService):
                     "qubit_count": len(self._labrad.qubits),
                 }
             else:
+                error_msg = self._labrad._init_error or "Unknown error"
+                self._fallback.on_connection_failed(error_msg)
+                self._fallback.start_reconnect_timer(self._do_reconnect)
                 return {
                     "success": False,
-                    "error": self._labrad._init_error or "Unknown error",
+                    "error": error_msg,
+                    "fallback_mode": True,
+                    "fallback_message": self._get_fallback_message(),
                 }
 
     def _handle_status(self) -> Dict[str, Any]:
         """获取连接状态"""
+        fallback_info = self._fallback.get_status_info()
         if self._labrad is None:
             return {
                 "connected": False,
                 "initialized": False,
                 "session_path": None,
-                "qubit_count": 0,
+                "qubit_count": len(self._fallback_qubits),
+                "fallback_mode": self._fallback.is_degraded,
+                "fallback_state": fallback_info["state"],
+                "last_error": self._fallback.last_error,
             }
 
         return {
             "connected": self._labrad.connected,
             "initialized": self._labrad._initialized,
             "session_path": self._labrad.session_path,
-            "qubit_count": len(self._labrad.qubits) if self._labrad.connected else 0,
+            "qubit_count": len(self._labrad.qubits) if self._labrad.connected else len(self._fallback_qubits),
             "init_error": self._labrad._init_error,
+            "fallback_mode": self._fallback.is_degraded,
+            "fallback_state": fallback_info["state"],
+            "last_error": self._fallback.last_error,
         }
 
     def _handle_qubits(self) -> Dict[str, Any]:
         """获取量子比特列表"""
+        # 离线模式优先返回离线数据
+        if self._is_offline_mode and self._offline_provider is not None:
+            qubits = self._offline_provider.get_qubits()
+            return {
+                "qubits": qubits,
+                "count": len(qubits),
+                "source": "offline",
+                "mode": self._get_mode(),
+            }
+
+        if self._fallback.is_degraded:
+            # 降级模式返回本地数据
+            return {
+                "qubits": self._fallback_qubits,
+                "count": len(self._fallback_qubits),
+                "source": "fallback",
+                "fallback_message": self._get_fallback_message(),
+            }
+
         if not self._ensure_connected():
-            return {"error": "Not connected to LabRAD", "qubits": [], "sessionPath": []}
+            # 未连接也返回降级数据
+            return {
+                "qubits": self._fallback_qubits,
+                "count": len(self._fallback_qubits),
+                "source": "fallback",
+                "fallback_message": self._get_fallback_message(),
+            }
 
         with self._labrad_lock:
             qubits = self._labrad.get_qubits()
             session_path = self._labrad.session_path
-            return {"qubits": qubits, "count": len(qubits), "sessionPath": session_path}
+            return {"qubits": qubits, "count": len(qubits), "sessionPath": session_path, "source": "live"}
 
     def _handle_experiments(self) -> Dict[str, Any]:
         """获取可用实验列表"""
+        # 离线模式优先返回离线数据
+        if self._is_offline_mode and self._offline_provider is not None:
+            experiments = self._offline_provider.get_experiments()
+            return {
+                "experiments": experiments,
+                "count": len(experiments),
+                "source": "offline",
+                "mode": self._get_mode(),
+            }
+
+        if self._fallback.is_degraded:
+            # 降级模式返回本地数据
+            return {
+                "experiments": self._fallback_experiments,
+                "count": len(self._fallback_experiments),
+                "source": "fallback",
+                "fallback_message": self._get_fallback_message(),
+            }
+
         if not self._ensure_connected():
-            return {"error": "Not connected to LabRAD", "experiments": []}
+            # 未连接也返回降级数据
+            return {
+                "experiments": self._fallback_experiments,
+                "count": len(self._fallback_experiments),
+                "source": "fallback",
+                "fallback_message": self._get_fallback_message(),
+            }
 
         with self._labrad_lock:
             experiments = self._labrad.list_experiments()
-            return {"experiments": experiments, "count": len(experiments)}
+            return {"experiments": experiments, "count": len(experiments), "source": "live"}
+
+    def _handle_datasets(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """获取数据集列表"""
+        path = data.get("path")
+        qubit = data.get("qubit")
+        experiment_type = data.get("experiment_type")
+        date = data.get("date")
+
+        # 离线模式返回离线数据
+        if self._is_offline_mode and self._offline_provider is not None:
+            datasets = self._offline_provider.get_datasets(
+                qubit=qubit,
+                experiment_type=experiment_type,
+                date=date
+            )
+            return {
+                "datasets": [
+                    {
+                        "id": ds.id,
+                        "name": ds.name,
+                        "qubit": ds.qubit,
+                        "experiment_type": ds.experiment_type,
+                        "date": ds.date,
+                        "file_size": ds.file_size,
+                    }
+                    for ds in datasets
+                ],
+                "count": len(datasets),
+                "source": "offline",
+            }
+
+        # 在线模式返回 LabRAD 数据
+        _log(f"datasets: path={path}, type={type(path)}")
+
+        if self._fallback.is_degraded:
+            return {
+                "error": "LabRAD 不可用",
+                "datasets": [],
+                "groups": [],
+                "fallback_message": self._get_fallback_message(),
+            }
+
+        if not self._ensure_connected():
+            return {
+                "error": "Not connected to LabRAD",
+                "datasets": [],
+                "groups": [],
+                "fallback_message": self._get_fallback_message(),
+            }
+
+        with self._labrad_lock:
+            dv = self._labrad.dv
+            try:
+                clean_path = []  # 默认空路径
+                if path:
+                    # path may be string like "LQHL/test" or array
+                    if isinstance(path, str):
+                        path = path.strip('/').split('/')
+                    # 先 cd 到根目录，再 cd 到目标路径（绝对路径）
+                    dv.cd('')  # go to root first
+                    clean_path = path[1:] if path and path[0] == '' else path
+                    _log(f"datasets: clean_path={clean_path}")
+                    if clean_path:
+                        dv.cd(clean_path)
+                else:
+                    dv.cd('')  # go to root
+                dirs = dv.dir()
+                _log(f"datasets: dirs[0]={dirs[0]}, dirs[1]={dirs[1][:10] if dirs[1] else []}...")
+                datasets = dirs[1] if len(dirs) > 1 else []
+                _log(f"datasets: found {len(datasets)} datasets")
+                # Return path as string for frontend compatibility
+                current_path = clean_path if clean_path else ['']
+                path_str = '/'.join(current_path)
+
+                # Convert to Dataset format for frontend
+                datasets_formatted = [
+                    {
+                        "id": ds_name,
+                        "name": ds_name,
+                        "path": path_str + '/' + ds_name if path_str else ds_name,
+                    }
+                    for ds_name in sorted(datasets)
+                ]
+
+                return {
+                    "datasets": datasets_formatted,
+                    "groups": sorted(dirs[0]) if dirs[0] else [],
+                    "path": path_str,
+                    "current_path": path_str,
+                    "source": "live",
+                }
+            except Exception as e:
+                _log(f"datasets: error = {e}")
+                return {"error": str(e), "datasets": [], "groups": [], "path": ""}
 
     def _handle_execute(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """执行实验代码
 
         带 busy 锁，防止并发执行。
         如果正在执行，返回 busy 状态（降级服务）。
+        离线模式下执行模拟实验。
         """
-        if not self._ensure_connected():
-            return {"error": "Not connected to LabRAD"}
-
         code = data.get("code")
         task_id = data.get("task_id", f"task_{int(time.time() * 1000)}")
         timeout = data.get("timeout", 300)
 
         if not code:
             return {"error": "code is required"}
+
+        # 离线模式下执行模拟实验
+        if self._is_offline_mode:
+            return self._execute_offline_simulation(code, task_id, data)
+
+        # 降级模式下拒绝执行实验
+        if self._fallback.is_degraded:
+            return {
+                "task_id": task_id,
+                "status": "degraded",
+                "error": "LabRAD 不可用，无法执行实验",
+                "fallback_message": self._get_fallback_message(),
+            }
+
+        if not self._ensure_connected():
+            return {
+                "task_id": task_id,
+                "status": "error",
+                "error": "Not connected to LabRAD",
+            }
 
         # 尝试获取 busy 锁
         if not self._try_acquire_busy(task_id):
@@ -418,8 +946,21 @@ class QuantumService(BaseService):
 
     def _handle_sessions(self) -> Dict[str, Any]:
         """获取会话列表"""
+        if self._fallback.is_degraded:
+            return {
+                "error": "LabRAD 不可用",
+                "sessions": [],
+                "current": None,
+                "fallback_message": self._get_fallback_message(),
+            }
+
         if not self._ensure_connected():
-            return {"error": "Not connected to LabRAD", "sessions": []}
+            return {
+                "error": "Not connected to LabRAD",
+                "sessions": [],
+                "current": None,
+                "fallback_message": self._get_fallback_message(),
+            }
 
         with self._labrad_lock:
             dv = self._labrad.dv
@@ -462,9 +1003,21 @@ class QuantumService(BaseService):
         """获取会话目录树"""
         max_depth = data.get("max_depth", 5)
 
+        if self._fallback.is_degraded:
+            _log("session_tree: running in degraded mode")
+            return {
+                "error": "LabRAD 不可用",
+                "tree": [],
+                "fallback_message": self._get_fallback_message(),
+            }
+
         if not self._ensure_connected():
             _log("session_tree: LabRAD not connected")
-            return {"error": "Not connected to LabRAD", "tree": []}
+            return {
+                "error": "Not connected to LabRAD",
+                "tree": [],
+                "fallback_message": self._get_fallback_message(),
+            }
 
         with self._labrad_lock:
             dv = self._labrad.dv
@@ -563,6 +1116,22 @@ class QuantumService(BaseService):
         if not qname:
             return {"error": "Qubit name required"}
 
+        if self._fallback.is_degraded:
+            # 降级模式下尝试从本地数据获取
+            for q in self._fallback_qubits:
+                if q.get("name") == qname:
+                    return {
+                        "name": qname,
+                        "session_path": [],
+                        "params": q,
+                        "source": "fallback",
+                        "fallback_message": self._get_fallback_message(),
+                    }
+            return {
+                "error": f"Qubit {qname} not found in fallback data",
+                "fallback_message": self._get_fallback_message(),
+            }
+
         if not self._ensure_connected():
             return {"error": "Not connected to LabRAD"}
 
@@ -649,6 +1218,13 @@ class QuantumService(BaseService):
         if not qname:
             return {"success": False, "error": "Qubit name required"}
 
+        if self._fallback.is_degraded:
+            return {
+                "success": False,
+                "error": "LabRAD 不可用，无法设置参数",
+                "fallback_message": self._get_fallback_message(),
+            }
+
         if not self._ensure_connected():
             return {"success": False, "error": "Not connected to LabRAD"}
 
@@ -686,76 +1262,45 @@ class QuantumService(BaseService):
                 "errors": errors if errors else None,
             }
 
-    def _handle_datasets(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """获取数据集列表"""
-        path = data.get("path")
-
-        _log(f"datasets: path={path}, type={type(path)}")
-
-        if not self._ensure_connected():
-            return {"error": "Not connected to LabRAD", "datasets": [], "groups": []}
-
-        with self._labrad_lock:
-            dv = self._labrad.dv
-            try:
-                clean_path = []  # 默认空路径
-                if path:
-                    # path may be string like "LQHL/test" or array
-                    if isinstance(path, str):
-                        path = path.strip('/').split('/')
-                    # 先 cd 到根目录，再 cd 到目标路径（绝对路径）
-                    dv.cd('')  # go to root first
-                    clean_path = path[1:] if path and path[0] == '' else path
-                    _log(f"datasets: clean_path={clean_path}")
-                    if clean_path:
-                        dv.cd(clean_path)
-                else:
-                    dv.cd('')  # go to root
-                dirs = dv.dir()
-                _log(f"datasets: dirs[0]={dirs[0]}, dirs[1]={dirs[1][:10] if dirs[1] else []}...")
-                datasets = dirs[1] if len(dirs) > 1 else []
-                _log(f"datasets: found {len(datasets)} datasets")
-                # Return path as string for frontend compatibility
-                current_path = clean_path if clean_path else ['']
-                path_str = '/'.join(current_path)
-
-                # Convert to Dataset format for frontend
-                datasets_formatted = [
-                    {
-                        "id": ds_name,
-                        "name": ds_name,
-                        "path": path_str + '/' + ds_name if path_str else ds_name,
-                    }
-                    for ds_name in sorted(datasets)
-                ]
-
-                return {
-                    "datasets": datasets_formatted,
-                    "groups": sorted(dirs[0]) if dirs[0] else [],
-                    "path": path_str,
-                    "current_path": path_str,
-                }
-            except Exception as e:
-                _log(f"datasets: error = {e}")
-                return {"error": str(e), "datasets": [], "groups": [], "path": ""}
-
     def get_health(self) -> Dict[str, Any]:
         """获取健康状态"""
         labrad_ok = self._labrad is not None and self._labrad.connected
+        fallback_info = self._fallback.get_status_info()
+
+        # 判断是否应该报告为健康
+        # - LabRAD 已连接: healthy
+        # - 离线模式: healthy (degraded 是预期状态)
+        # - 自动模式 + 离线数据可用: healthy
+        # - 在线模式 + LabRAD 未连接: degraded (真正的异常)
+        if labrad_ok:
+            is_healthy = True
+        elif self._get_mode() == self.Mode.OFFLINE:
+            is_healthy = True  # 离线模式，degraded 是预期状态
+        elif self._get_mode() == self.Mode.AUTO and self._offline_provider is not None:
+            is_healthy = True  # 自动模式有离线数据兜底
+        else:
+            is_healthy = False  # 在线模式但 LabRAD 不可用，才是异常
+
         return {
-            "status": "healthy" if labrad_ok else "degraded",
+            "status": "healthy" if is_healthy else "degraded",
             "service": "quantum_service",
             "labrad_connected": labrad_ok,
+            "fallback_mode": self._fallback.is_degraded,
+            "fallback_state": fallback_info["state"],
             "init_started": self._init_started,
             "ready": not self._busy.is_set(),
             "busy": self._busy.is_set(),
             "current_task": self._current_task_id,
             "running_tasks": len(self._running_tasks),
             "session_path": self._labrad.session_path if self._labrad else None,
+            "fallback_message": self._get_fallback_message(),
+            "mode": self._get_mode(),
         }
 
     def shutdown(self):
         """关闭服务"""
+        # 停止重连定时器
+        self._fallback._cancel_retry_timer()
         if self._labrad:
             self._labrad.shutdown()
         super().shutdown()

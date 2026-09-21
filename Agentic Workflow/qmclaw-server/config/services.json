@@ -58,6 +58,22 @@
       "enabled": true,
       "script": "services/task_queue/server.py",
       "description": "任务队列服务 - 任务调度、重试"
+    },
+    "qca": {
+      "host": "localhost",
+      "port": 3011,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/qca_service/server.py",
+      "description": "QCA 服务 - 量子校准智能体"
+    },
+    "hermes": {
+      "host": "localhost",
+      "port": 3012,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/hermes_service/server.py",
+      "description": "Hermes Agent 服务 - AI 对话、工具调用、ReAct 推理"
     }
   }
 }

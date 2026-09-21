@@ -5,6 +5,7 @@ services/agent_service/server.py - Agent 服务
 - QuantumAgent - 量子实验执行智能体
 - ReAct 推理引擎
 - 工具注册和管理
+- 统一量子测控工具集成
 """
 
 import json
@@ -18,6 +19,10 @@ from enum import Enum
 
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config
+
+# 导入统一量子工具
+from ..common.quantum_tools import ToolRegistry, ToolResult
+from .adapter import AgentServiceAdapter, setup_agent_tools
 
 
 def _log(msg: str):
@@ -126,6 +131,7 @@ class AgentService(BaseService):
     - QuantumAgent - 量子实验执行智能体
     - ReAct 推理引擎
     - 工具注册和管理
+    - 统一量子测控工具（通过 adapter 集成）
     """
 
     def __init__(self, port: int = 3005):
@@ -136,7 +142,13 @@ class AgentService(BaseService):
         )
         super().__init__(cfg)
 
-        # 工具注册表
+        # 统一工具适配器
+        self._adapter = AgentServiceAdapter()
+
+        # 统一工具注册中心
+        self._registry = self._adapter.get_registry()
+
+        # 工具注册表（保留旧接口以兼容）
         self._tools: Dict[str, Tool] = {}
 
         # 测控服务客户端
@@ -170,61 +182,19 @@ class AgentService(BaseService):
 - 量子比特名称格式如 q10lu1
 """
 
-        _log("Agent service initialized")
+        # quantum_service 地址（通过 HTTP 调用）
+        self._quantum_service_url = "http://localhost:3003"
 
-    def _setup_paths(self):
-        """设置 Python 路径"""
-        import sys as _sys
-        from pathlib import Path as _Path
+        # 初始化 adapter（通过 HTTP 调用 quantum_service）
+        self._adapter = AgentServiceAdapter(self._quantum_service_url)
+        self._registry = self._adapter.get_registry()
 
-        root = _Path(__file__).parent.parent.parent.parent
-        sq_workflow = root / "measure_scripts" / "measure_scripts" / "sq_workflow"
-        measure_scripts = root / "measure_scripts" / "measure_scripts"
-
-        for _path in [str(sq_workflow), str(measure_scripts)]:
-            if _path not in _sys.path:
-                _sys.path.insert(0, _path)
+        _log("Agent service initialized with unified quantum tools (HTTP to quantum_service)")
 
     def register_tool(self, tool: Tool):
         """注册工具"""
         self._tools[tool.name] = tool
         _log(f"Registered tool: {tool.name}")
-
-    def set_quantum_client(self, client):
-        """设置测控服务客户端"""
-        self._quantum_client = client
-
-        # 注册工具
-        self.register_tool(QuantumExperimentTool(self._execute_experiment))
-        self.register_tool(GetQubitsTool(self._get_qubits))
-        self.register_tool(ListExperimentsTool(self._list_experiments))
-
-        _log("Quantum client set, tools registered")
-
-    def _execute_experiment(self, code: str) -> Dict[str, Any]:
-        """执行实验"""
-        if self._quantum_client:
-            # 直接调用 LabRAD
-            with self._quantum_client.lock:
-                sq = self._quantum_client.sq
-                s = self._quantum_client.s
-                local_vars = {"sq": sq, "s": s, "__builtins__": __builtins__}
-                exec_result = {}
-                exec(code, local_vars, exec_result)
-                return exec_result
-        return {"error": "Quantum client not connected"}
-
-    def _get_qubits(self) -> List[Dict[str, Any]]:
-        """获取量子比特"""
-        if self._quantum_client:
-            return self._quantum_client.get_qubits()
-        return []
-
-    def _list_experiments(self) -> List[Dict[str, str]]:
-        """列出实验"""
-        if self._quantum_client:
-            return self._quantum_client.list_experiments()
-        return []
 
     def _call_llm(self, messages: List[Dict], model: str = "minimax", temperature: float = 0.7) -> Dict[str, Any]:
         """调用 LLM 服务"""
@@ -344,6 +314,10 @@ class AgentService(BaseService):
 
     def handle_request(self, method: str, path: str, data: Dict[str, Any], query: Dict[str, List[str]]) -> Dict[str, Any]:
         """处理 Agent 请求"""
+        # API v1 路由
+        if path.startswith("/api/v1/"):
+            return self._handle_api_v1(path, method, data)
+
         # 路由
         if path == "/health":
             return self._handle_health()
@@ -360,6 +334,68 @@ class AgentService(BaseService):
         else:
             raise ValueError(f"Unknown path: {path}")
 
+    def _handle_api_v1(self, path: str, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """处理 API v1 请求"""
+        import uuid
+
+        # /api/v1/tools - 列出所有工具
+        if path == "/api/v1/tools" and method == "GET":
+            return {
+                "success": True,
+                "data": self._registry.get_definitions(),
+                "count": len(self._registry.list_tools()),
+                "request_id": f"req_{uuid.uuid4().hex[:12]}",
+            }
+
+        # /api/v1/tools/{name} - 获取工具 schema
+        if path.startswith("/api/v1/tools/") and method == "GET":
+            tool_name = path.split("/api/v1/tools/")[1]
+            schema = self._registry.get_schema(tool_name)
+            if schema:
+                return {
+                    "success": True,
+                    "data": schema,
+                    "request_id": f"req_{uuid.uuid4().hex[:12]}",
+                }
+            return {
+                "success": False,
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"Tool '{tool_name}' not found",
+                },
+            }
+
+        # /api/v1/tools/{name} - 执行工具
+        if path.startswith("/api/v1/tools/") and method == "POST":
+            tool_name = path.split("/api/v1/tools/")[1]
+            result = self._registry.execute(tool_name, data)
+            return result.to_api_response(request_id=f"req_{uuid.uuid4().hex[:12]}")
+
+        # /api/v1/qubits - 获取量子比特
+        if path == "/api/v1/qubits" and method == "GET":
+            result = self._registry.execute("get_qubits", {})
+            return result.to_api_response(request_id=f"req_{uuid.uuid4().hex[:12]}")
+
+        # /api/v1/experiments - 列出实验
+        if path == "/api/v1/experiments" and method == "GET":
+            result = self._registry.execute("list_experiments", {})
+            return result.to_api_response(request_id=f"req_{uuid.uuid4().hex[:12]}")
+
+        # /api/v1/health
+        if path == "/api/v1/health":
+            return {
+                "success": True,
+                "data": {
+                    "status": "healthy",
+                    "service": "agent_service",
+                    "tool_count": len(self._registry.list_tools()),
+                    "connected": self._quantum_client is not None and self._quantum_client.connected,
+                },
+                "request_id": f"req_{uuid.uuid4().hex[:12]}",
+            }
+
+        raise ValueError(f"Unknown API path: {path}")
+
     def _handle_health(self) -> Dict[str, Any]:
         """健康检查"""
         return {
@@ -372,9 +408,25 @@ class AgentService(BaseService):
     def _handle_chat(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """处理聊天请求"""
         message = data.get("message")
+        model = data.get("model")
+        base_url = data.get("base_url")
+        enabled_toolsets = data.get("enabled_toolsets", [])
+        session_id = data.get("session_id")
         mode = data.get("mode", "react")
         context = data.get("context", {})
         task_id = data.get("task_id", f"task_{int(time.time() * 1000)}")
+
+        _log(f"DEBUG _handle_chat: message={message[:100] if message else None}...")
+        _log(f"DEBUG _handle_chat: model={model}, base_url={base_url}, enabled_toolsets={enabled_toolsets}")
+        _log(f"DEBUG _handle_chat: session_id={session_id}, mode={mode}")
+
+        # 检查是否是 Hermes 请求（带有 base_url 或 enabled_toolsets）
+        if base_url or enabled_toolsets:
+            _log("Detected Hermes-style request, but Hermes is not implemented in agent_service")
+            return {
+                "error": "Hermes not implemented in microservice mode. Please use legacy mode or implement hermes_service.",
+                "hint": "Set USE_MICROSERVICES=false in index.ts to use legacy backend"
+            }
 
         if not message:
             return {"error": "message is required"}
@@ -514,7 +566,16 @@ class AgentService(BaseService):
                 "name": tool.name,
                 "description": tool.description,
             })
-        return {"tools": tools, "count": len(tools)}
+
+        # 获取统一工具定义
+        unified_tools = self._registry.get_definitions()
+
+        return {
+            "tools": tools,
+            "count": len(tools),
+            "unified_tools": unified_tools,
+            "unified_count": len(unified_tools),
+        }
 
     def get_health(self) -> Dict[str, Any]:
         """获取健康状态"""

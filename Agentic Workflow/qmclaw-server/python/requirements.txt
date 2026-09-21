@@ -1,8 +1,41 @@
 # qmclaw-server Python dependencies
+
+# Core scientific computing
 numpy>=1.20.0
 scipy>=1.7.0
-labrad>=0.9.0
 matplotlib>=3.5.0
-envelopes-qc>=0.1.0
 sympy>=1.10.0
+h5py>=3.10.0  # HDF5 for QCA experiment storage
+
+# LabRAD - Quantum measurement control system
+labrad>=0.9.0
+pyopenssl>=24.0.0  # Required: older versions incompatible with cryptography>=50.0.0
+pywin32>=300  # Windows API for LabRAD GUI
+
+# QMClaw framework (private package)
 lqms @ git+https://github.com/...@main#egg=lqms
+
+# Configuration management
+python-dotenv>=1.0.0  # Load .env files
+
+# Data processing
+envelopes-qc>=0.1.0
+
+# QCA Service - Deep Agent dependencies
+# Install from vendor's local package for development
+# deepagents==0.5.3
+# deepagents-cli==0.0.40
+
+# LangChain ecosystem for Deep Agent
+langchain-core>=0.3.0
+langgraph>=0.2.0
+
+# FastAPI for QCA service
+fastapi>=0.136.0
+uvicorn>=0.30.0
+
+# Ray - Distributed computing (for multi-node setup)
+# ray>=2.0.0  # Optional: only if using distributed mode
+
+# Optional: IPython for debugging
+# ipython>=8.0.0

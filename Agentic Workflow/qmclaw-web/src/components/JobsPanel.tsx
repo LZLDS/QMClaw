@@ -9,11 +9,24 @@ interface Dataset {
   id: string;
   name: string;
   path: string;
+  qubit?: string;
+  experiment_type?: string;
+  date?: string;
+  file_size?: number;
 }
 
 interface SessionConfig {
   user: string;
   path: string[];
+}
+
+// Offline mode state type
+interface OfflineModeState {
+  enabled: boolean;
+  qubits: string[];
+  selectedQubit: string;
+  selectedExpType: string;
+  selectedDate: string;
 }
 
 // ── StatusDot ─────────────────────────────────────────────────────────────────
@@ -185,18 +198,25 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
   const [selectedDs, setSelectedDs] = useState<Dataset | null>(null);
+  const [plottingDsId, setPlottingDsId] = useState<string | null>(null);
   const PAGE_SIZE = 20;
+
+  // Offline mode state
+  const [offlineMode, setOfflineMode] = useState(false);
+  const [offlineQubits, setOfflineQubits] = useState<string[]>([]);
+  const [offlineSelectedQubit, setOfflineSelectedQubit] = useState<string>("");
+  const [offlineDatasets, setOfflineDatasets] = useState<Dataset[]>([]);
+  const [offlineLoading, setOfflineLoading] = useState(false);
 
   // Load session config from quantum service
   useEffect(() => {
     const loadConfig = async () => {
       try {
-        const res = await api.listQubits() as { sessionPath?: string[]; error?: string };
+        const res = await api.listQubits() as { sessionPath?: string[]; error?: string; source?: string };
         if (res.sessionPath && res.sessionPath.length > 0) {
-          // sessionPath format: ['', 'LQHL', 'test', '20260324']
           const sp = res.sessionPath;
           const user = sp.length > 1 ? sp[1] : 'LQHL';
-          const path = sp.slice(2);  // remove ['', user] prefix
+          const path = sp.slice(2);
           setSessionConfig({ user, path });
         }
       } catch (e) {
@@ -205,6 +225,94 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
     };
     loadConfig();
   }, []);
+
+  // Check offline mode status and load offline qubits
+  useEffect(() => {
+    const checkOfflineStatus = async () => {
+      try {
+        const modeRes = await api.quantumMode() as { mode?: string; offline_available?: boolean };
+        const isOffline = modeRes.mode === "offline" || (modeRes.mode === "auto" && !modeRes.offline_available);
+        console.log('[DataVault] Mode check:', { modeRes, isOffline });
+        setOfflineMode(isOffline);
+
+        // Always try to load qubits - the service will return offline data if in offline mode
+        const qubitsRes = await api.listQubits() as { qubits?: Array<{ name: string }>; source?: string; error?: string };
+        console.log('[DataVault] Qubits loaded:', { source: qubitsRes.source, count: qubitsRes.qubits?.length });
+
+        // If we're in offline mode OR the service returned offline data
+        if (isOffline || qubitsRes.source === "offline") {
+          if (qubitsRes.qubits && qubitsRes.qubits.length > 0) {
+            setOfflineQubits(qubitsRes.qubits.map(q => q.name));
+            if (!offlineSelectedQubit) {
+              setOfflineSelectedQubit(qubitsRes.qubits[0].name);
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[DataVaultCard] Failed to check offline status:', e);
+      }
+    };
+    checkOfflineStatus();
+  }, []);
+
+  // Load offline datasets when qubit changes
+  useEffect(() => {
+    if (offlineMode && offlineSelectedQubit) {
+      loadOfflineDatasets();
+    }
+  }, [offlineMode, offlineSelectedQubit]);
+
+  const loadOfflineDatasets = async () => {
+    setOfflineLoading(true);
+    try {
+      const res = await api.listOfflineDatasets({ qubit: offlineSelectedQubit }) as { datasets: Dataset[]; error?: string };
+      if (res.datasets) {
+        setOfflineDatasets(res.datasets);
+        setPage(1);
+      }
+    } catch (e: any) {
+      console.error('[DataVaultCard] Failed to load offline datasets:', e);
+    } finally {
+      setOfflineLoading(false);
+    }
+  };
+
+  // Handle plotting offline dataset (using v2 API with qter.fitData support)
+  // Dispatches event to Experiments page for rendering
+  const handlePlotOfflineDataset = async (ds: Dataset) => {
+    setPlottingDsId(ds.id);
+    try {
+      // Use the new v2 API that supports qter.fitData() style commands
+      const res = await api.plotOfflineDatasetV2({
+        dataset_id: ds.id,
+        command: "qter.fitData(do_plot=True)"
+      }) as {
+        success: boolean;
+        image?: string;
+        plotUrl?: string;
+        error?: string;
+        dataset_name?: string;
+        qubit?: string;
+        experiment_type?: string;
+      };
+
+      if (res.success) {
+        // Dispatch event to Experiments page with Base64 image
+        if (res.image) {
+          window.dispatchEvent(new CustomEvent("dataset:plot-offline", {
+            detail: { dataset_id: ds.id, image: res.image }
+          }));
+        }
+      } else if (res.error) {
+        console.error('[DataVaultCard] Plot error:', res.error);
+      }
+    } catch (e: any) {
+      console.error('[DataVaultCard] Failed to plot:', e);
+    } finally {
+      setPlottingDsId(null);
+      // Don't clear selectedDs - user may want to use it for variant generation
+    }
+  };
 
   // Check LabRAD availability via quantum service health
   const checkLabradAvailable = async (): Promise<boolean> => {
@@ -232,7 +340,6 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
     try {
       const path = "/" + sessionConfig.user + "/" + sessionConfig.path.join("/");
       const res = await api.listDatasets(path) as { datasets: Dataset[] };
-      // Reverse for descending order
       setDatasets(res.datasets.reverse());
       setPage(1);
     } catch (e: any) {
@@ -248,15 +355,16 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
   }, [sessionConfig]);
 
   useEffect(() => {
-    if (sessionConfig && labradAvailable) {
+    if (sessionConfig && labradAvailable && !offlineMode) {
       loadDatasets();
     }
-  }, [sessionConfig, labradAvailable, loadDatasets, refreshTrigger]);
+  }, [sessionConfig, labradAvailable, loadDatasets, refreshTrigger, offlineMode]);
 
-  // Filter datasets
+  // Filter datasets (use offline datasets when in offline mode)
+  const displayDatasets = offlineMode ? offlineDatasets : datasets;
   const filteredDatasets = filter
-    ? datasets.filter(ds => ds.name.toLowerCase().includes(filter.toLowerCase()))
-    : datasets;
+    ? displayDatasets.filter(ds => ds.name.toLowerCase().includes(filter.toLowerCase()))
+    : displayDatasets;
 
   // Paginate
   const totalPages = Math.ceil(filteredDatasets.length / PAGE_SIZE);
@@ -265,6 +373,8 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
   const sessionPath = sessionConfig
     ? `${sessionConfig.user}/${sessionConfig.path.join("/")}`
     : "...";
+
+  const isLoading = offlineMode ? offlineLoading : loading;
 
   return (
     <div style={{
@@ -288,25 +398,84 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
         justifyContent: "space-between",
         alignItems: "center",
       }}>
-        <span>📂 DATAVAULT</span>
-        <span
-          onClick={loadDatasets}
-          style={{ color: "#38bdf8", cursor: "pointer", fontWeight: 400 }}
-          title="Refresh"
-        >↻</span>
+        <span style={{ color: offlineMode ? "#f59e0b" : "#475569" }}>
+          📂 DATAVAULT {offlineMode && "📦OFFLINE"}
+        </span>
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+          {offlineMode && selectedDs && (
+            <button
+              onClick={() => {
+                // Dispatch event to open variant generator in parent
+                window.dispatchEvent(new CustomEvent("dataset:open-variant-generator", {
+                  detail: {
+                    dataset_id: selectedDs.id,
+                    name: selectedDs.name,
+                    qubit: selectedDs.qubit,
+                    experiment_type: selectedDs.experiment_type,
+                  }
+                }));
+              }}
+              style={{
+                padding: "0.1rem 0.4rem",
+                background: "#6366f1",
+                border: "none",
+                borderRadius: "0.2rem",
+                color: "#fff",
+                cursor: "pointer",
+                fontSize: "0.6rem",
+                fontWeight: 600,
+              }}
+              title="Generate variant"
+            >
+              🔬
+            </button>
+          )}
+          <span
+            onClick={() => offlineMode ? loadOfflineDatasets() : loadDatasets()}
+            style={{ color: "#38bdf8", cursor: "pointer", fontWeight: 400 }}
+            title="Refresh"
+          >↻</span>
+        </div>
       </div>
 
-      {/* Session path */}
-      <div style={{
-        padding: "0.2rem 0.75rem",
-        borderBottom: "1px solid #1e293b",
-        fontSize: "0.6rem",
-        color: "#64748b",
-        fontFamily: "monospace",
-        background: "#0f172a",
-      }}>
-        📍 {sessionPath}
-      </div>
+      {/* Offline mode qubit selector */}
+      {offlineMode && (
+        <div style={{ padding: "0.3rem 0.5rem", borderBottom: "1px solid #1e293b" }}>
+          <select
+            value={offlineSelectedQubit}
+            onChange={(e) => setOfflineSelectedQubit(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "0.2rem 0.3rem",
+              background: "#1e293b",
+              border: "1px solid #334155",
+              borderRadius: "0.2rem",
+              color: "#e2e8f0",
+              fontSize: "0.65rem",
+              fontFamily: "monospace",
+              boxSizing: "border-box",
+            }}
+          >
+            {offlineQubits.map(q => (
+              <option key={q} value={q}>{q}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* Session path (only in online mode) */}
+      {!offlineMode && (
+        <div style={{
+          padding: "0.2rem 0.75rem",
+          borderBottom: "1px solid #1e293b",
+          fontSize: "0.6rem",
+          color: "#64748b",
+          fontFamily: "monospace",
+          background: "#0f172a",
+        }}>
+          📍 {sessionPath}
+        </div>
+      )}
 
       {/* Filter input */}
       <div style={{
@@ -350,34 +519,87 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
 
       {/* Dataset list */}
       <div style={{ flex: 1, overflow: "auto", minHeight: "80px" }}>
-        {loading && (
+        {isLoading && (
           <div style={{ padding: "0.5rem", color: "#334569", fontSize: "0.7rem", textAlign: "center" }}>
             Loading...
           </div>
         )}
-        {!loading && !error && labradAvailable && paginatedDatasets.map((ds) => (
+        {!isLoading && !error && paginatedDatasets.map((ds) => (
           <div
             key={ds.id}
-            onClick={() => setSelectedDs(selectedDs?.id === ds.id ? null : ds)}
+            onClick={() => {
+              // In offline mode: select/deselect (like online mode)
+              // User can then click 🔬 button to open variant generator
+              setSelectedDs(selectedDs?.id === ds.id ? null : ds);
+            }}
             style={{
               padding: "0.25rem 0.75rem",
               borderBottom: "1px solid #1e293b",
               cursor: "pointer",
               background: selectedDs?.id === ds.id ? "#1e3a5f" : "transparent",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.5rem",
             }}
           >
+            {offlineMode && (
+              <span style={{
+                fontSize: "0.5rem",
+                color: plottingDsId === ds.id ? "#38bdf8" : "#64748b",
+                width: "12px",
+              }}>
+                {plottingDsId === ds.id ? "⏳" : "📊"}
+              </span>
+            )}
             <div style={{
               fontFamily: "monospace",
               fontSize: "0.65rem",
               color: selectedDs?.id === ds.id ? "#38bdf8" : "#94a3b8",
+              flex: 1,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
             }}>
-              📊 {ds.name}
+              {ds.name}
             </div>
+            {offlineMode && ds.qubit && (
+              <span style={{
+                fontSize: "0.55rem",
+                color: "#64748b",
+                background: "#1e293b",
+                padding: "0.1rem 0.3rem",
+                borderRadius: "0.2rem",
+              }}>
+                {ds.qubit}
+              </span>
+            )}
+            {/* Quick plot button in offline mode */}
+            {offlineMode && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handlePlotOfflineDataset(ds);
+                }}
+                disabled={plottingDsId === ds.id}
+                style={{
+                  background: "transparent",
+                  border: "1px solid #334155",
+                  borderRadius: "0.2rem",
+                  color: plottingDsId === ds.id ? "#334155" : "#64748b",
+                  cursor: plottingDsId === ds.id ? "not-allowed" : "pointer",
+                  padding: "0.1rem 0.3rem",
+                  fontSize: "0.6rem",
+                }}
+                title="Plot dataset"
+              >
+                📈
+              </button>
+            )}
           </div>
         ))}
-        {!loading && !error && labradAvailable && filteredDatasets.length === 0 && (
+        {!isLoading && !error && filteredDatasets.length === 0 && (
           <div style={{ padding: "0.5rem", color: "#334569", fontSize: "0.7rem", textAlign: "center" }}>
-            No datasets found
+            {offlineMode ? "No offline datasets" : "No datasets found"}
           </div>
         )}
       </div>
@@ -425,54 +647,6 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
             }}
           >
             ›
-          </button>
-        </div>
-      )}
-
-      {/* Selected dataset actions */}
-      {selectedDs && sessionConfig && (
-        <div style={{
-          borderTop: "1px solid #1e293b",
-          padding: "0.3rem 0.5rem",
-          background: "#0f172a",
-          display: "flex",
-          flexDirection: "column",
-          gap: "0.25rem",
-        }}>
-          <div style={{
-            fontSize: "0.55rem",
-            color: "#475569",
-            fontFamily: "monospace",
-            paddingLeft: "0.25rem",
-          }}>
-            📊 {selectedDs.name}
-          </div>
-          <button
-            onClick={() => {
-              // Dispatch event to plot this dataset in the experiments page
-              window.dispatchEvent(new CustomEvent("dataset:plot-in-experiments", {
-                detail: {
-                  name: selectedDs.id,
-                  path: `/${sessionConfig.user}/${sessionConfig.path.join("/")}`,
-                }
-              }));
-            }}
-            style={{
-              padding: "0.25rem 0.5rem",
-              background: "#6366f1",
-              border: "none",
-              borderRadius: "0.2rem",
-              color: "#fff",
-              fontSize: "0.6rem",
-              fontWeight: 600,
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: "0.3rem",
-            }}
-          >
-            📊 在 Experiments 绘图
           </button>
         </div>
       )}

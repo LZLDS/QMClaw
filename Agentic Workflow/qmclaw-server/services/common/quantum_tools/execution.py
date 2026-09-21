@@ -1,0 +1,415 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 QMClaw. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+实验执行工具
+
+提供实验执行相关的量子工具实现。
+"""
+
+import json
+import sys
+import threading
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from .base import ExperimentResult, ParameterSchema, QuantumTool, ToolResult, ToolSchema
+from .errors import (
+    ErrorCode,
+    ExperimentNotFoundError,
+    ExecutionError,
+    LabRADError,
+    QMClawError,
+    TimeoutError,
+)
+
+
+class RunCodeTool(QuantumTool):
+    """直接执行代码工具
+
+    直接执行 Python 代码字符串，调用 LabRAD 实验函数。
+    """
+
+    def __init__(
+        self,
+        executor: Callable[[str], Dict[str, Any]],
+        is_connected: Callable[[], bool] = None,
+    ):
+        """
+        Args:
+            executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
+            is_connected: 连接检查函数，签名为 () -> bool
+        """
+        self._executor = executor
+        self._is_connected = is_connected or (lambda: True)
+
+    @property
+    def name(self) -> str:
+        return "run_code"
+
+    @property
+    def description(self) -> str:
+        return """Execute Python code to run quantum experiments.
+Use sq.* functions to execute experiments, e.g., sq.iqraw(), sq.t1(), sq.spectroscopy().
+Returns the experiment result or error message."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters={
+                "code": ParameterSchema(
+                    name="code",
+                    type="string",
+                    description="Python code to execute. Use sq.* functions like sq.iqraw(), sq.t1().",
+                    required=True,
+                ),
+                "timeout": ParameterSchema(
+                    name="timeout",
+                    type="number",
+                    description="Maximum execution time in seconds",
+                    required=False,
+                    default=300,
+                    minimum=1,
+                    maximum=3600,
+                ),
+            },
+        )
+
+    def execute(self, code: str, timeout: int = 300, **kwargs) -> ToolResult[Dict[str, Any]]:
+        """执行代码"""
+        if not self._is_connected():
+            return ToolResult.err(
+                "Not connected to LabRAD",
+                error_code=ErrorCode.LABRAD_ERROR.value,
+                hint="Call connect() first or check if LabRAD server is running",
+            )
+
+        if not code or not code.strip():
+            return ToolResult.err(
+                "Code cannot be empty",
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+            )
+
+        start_time = time.time()
+
+        try:
+            result = self._executor(code)
+            elapsed = time.time() - start_time
+
+            return ToolResult.ok(
+                data={
+                    "result": result,
+                    "elapsed_seconds": elapsed,
+                },
+                execution_time=elapsed,
+                source="labrad",
+            )
+
+        except TimeoutError:
+            return ToolResult.err(
+                f"Execution timed out after {timeout}s",
+                error_code=ErrorCode.TIMEOUT.value,
+                timeout=timeout,
+            )
+
+        except SyntaxError as e:
+            return ToolResult.err(
+                f"Syntax error: {e}",
+                error_code=ErrorCode.EXECUTION_ERROR.value,
+                code=code,
+                line=e.lineno,
+                hint="Check the Python syntax",
+            )
+
+        except NameError as e:
+            return ToolResult.err(
+                f"Name error: {e}",
+                error_code=ErrorCode.EXECUTION_ERROR.value,
+                code=code,
+                hint="Check variable and function names",
+            )
+
+        except Exception as e:
+            return ToolResult.err(
+                str(e),
+                error_code=ErrorCode.EXECUTION_ERROR.value,
+                traceback=traceback.format_exc(),
+            )
+
+
+class RunExperimentTool(QuantumTool):
+    """执行命名实验工具
+
+    通过实验名称和参数执行预定义的量子实验。
+    """
+
+    def __init__(
+        self,
+        code_builder: Callable[[str, Dict[str, Any]], str],
+        executor: Callable[[str], Dict[str, Any]],
+        schema_getter: Callable[[str], Optional[Dict[str, Any]]] = None,
+        is_connected: Callable[[], bool] = None,
+    ):
+        """
+        Args:
+            code_builder: 代码构建函数，签名为 (name: str, params: Dict) -> str
+            executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
+            schema_getter: 实验 schema 获取函数，签名为 (name: str) -> Optional[Dict]
+            is_connected: 连接检查函数，签名为 () -> bool
+        """
+        self._code_builder = code_builder
+        self._executor = executor
+        self._schema_getter = schema_getter
+        self._is_connected = is_connected or (lambda: True)
+
+    @property
+    def name(self) -> str:
+        return "run_experiment"
+
+    @property
+    def description(self) -> str:
+        return """Execute a quantum experiment by name.
+Common experiments: t1, ramsey_df, spectroscopy, iqraw, piamp, single_shot.
+Returns experiment results including measured data and parameters."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters={
+                "experiment_name": ParameterSchema(
+                    name="experiment_name",
+                    type="string",
+                    description="Experiment name (e.g., 't1', 'ramsey_df', 'spectroscopy')",
+                    required=True,
+                ),
+                "params": ParameterSchema(
+                    name="params",
+                    type="object",
+                    description="Experiment parameters as key-value pairs",
+                    required=False,
+                    default={},
+                ),
+                "target": ParameterSchema(
+                    name="target",
+                    type="string",
+                    description="Target qubit name (e.g., 'q10lu1')",
+                    required=False,
+                ),
+                "notes": ParameterSchema(
+                    name="notes",
+                    type="string",
+                    description="Optional notes about this experiment run",
+                    required=False,
+                    default="",
+                ),
+                "timeout": ParameterSchema(
+                    name="timeout",
+                    type="number",
+                    description="Maximum execution time in seconds",
+                    required=False,
+                    default=300,
+                    minimum=1,
+                    maximum=3600,
+                ),
+            },
+        )
+
+    def execute(
+        self,
+        experiment_name: str,
+        params: Dict[str, Any] = None,
+        target: str = None,
+        notes: str = "",
+        timeout: int = 300,
+        **kwargs,
+    ) -> ToolResult[Dict[str, Any]]:
+        """执行实验"""
+        if not experiment_name:
+            return ToolResult.err(
+                "experiment_name is required",
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+            )
+
+        if not self._is_connected():
+            return ToolResult.err(
+                "Not connected to LabRAD",
+                error_code=ErrorCode.LABRAD_ERROR.value,
+            )
+
+        params = params or {}
+
+        # 如果指定了 target，添加到 params
+        if target:
+            params["target"] = target
+
+        start_time = time.time()
+        now = datetime.now(timezone.utc)
+        exp_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{experiment_name}"
+
+        try:
+            # 构建代码
+            code = self._code_builder(experiment_name, params)
+
+            # 执行
+            result = self._executor(code)
+            elapsed = time.time() - start_time
+
+            # 解析结果
+            success = result.get("status") == "success"
+            experiment_result = ExperimentResult(
+                id=exp_id,
+                experiment_name=experiment_name,
+                status="success" if success else "failed",
+                started_at=now.isoformat().replace("+00:00", "Z"),
+                completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                target=target,
+                params=params,
+                results=result.get("result", {}),
+                error=result.get("error"),
+                notes=notes,
+            )
+
+            return ToolResult.ok(
+                data=experiment_result.to_dict(),
+                execution_time=elapsed,
+                source="labrad",
+            )
+
+        except QMClawError:
+            raise
+        except Exception as e:
+            return ToolResult.err(
+                str(e),
+                error_code=ErrorCode.EXECUTION_ERROR.value,
+                experiment_name=experiment_name,
+            )
+
+
+class ListExperimentsTool(QuantumTool):
+    """列出实验工具"""
+
+    def __init__(
+        self,
+        lister: Callable[[], List[Dict[str, str]]],
+    ):
+        """
+        Args:
+            lister: 实验列表获取函数，签名为 () -> List[Dict]
+        """
+        self._lister = lister
+
+    @property
+    def name(self) -> str:
+        return "list_experiments"
+
+    @property
+    def description(self) -> str:
+        return "List all available quantum experiments. Returns experiment names and descriptions."
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters={
+                "filter": ParameterSchema(
+                    name="filter",
+                    type="string",
+                    description="Optional filter to search experiment names",
+                    required=False,
+                ),
+            },
+        )
+
+    def execute(self, filter: str = None, **kwargs) -> ToolResult[List[Dict[str, Any]]]:
+        """列出实验"""
+        try:
+            experiments = self._lister()
+
+            if filter:
+                filter_lower = filter.lower()
+                experiments = [
+                    e for e in experiments
+                    if filter_lower in e.get("name", "").lower()
+                    or filter_lower in e.get("doc", "").lower()
+                ]
+
+            return ToolResult.ok(data=experiments)
+
+        except Exception as e:
+            return ToolResult.err(
+                str(e),
+                error_code=ErrorCode.INTERNAL_ERROR.value,
+            )
+
+
+class GetExperimentSchemaTool(QuantumTool):
+    """获取实验 Schema 工具"""
+
+    def __init__(
+        self,
+        schema_getter: Callable[[str], Optional[Dict[str, Any]]],
+        experiment_lister: Callable[[], List[Dict[str, str]]] = None,
+    ):
+        """
+        Args:
+            schema_getter: schema 获取函数，签名为 (name: str) -> Optional[Dict]
+            experiment_lister: 实验列表获取函数，签名为 () -> List[Dict]
+        """
+        self._schema_getter = schema_getter
+        self._experiment_lister = experiment_lister
+
+    @property
+    def name(self) -> str:
+        return "get_experiment_schema"
+
+    @property
+    def description(self) -> str:
+        return "Get the parameter schema for a specific experiment."
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters={
+                "experiment_name": ParameterSchema(
+                    name="experiment_name",
+                    type="string",
+                    description="Experiment name to get schema for",
+                    required=True,
+                ),
+            },
+        )
+
+    def execute(self, experiment_name: str, **kwargs) -> ToolResult[Dict[str, Any]]:
+        """获取实验 schema"""
+        if not experiment_name:
+            return ToolResult.err(
+                "experiment_name is required",
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+            )
+
+        schema = self._schema_getter(experiment_name)
+
+        if schema is None:
+            # 尝试从实验列表获取
+            available = []
+            if self._experiment_lister:
+                available = [e.get("name", "") for e in self._experiment_lister()]
+
+            return ToolResult.err(
+                f"Experiment '{experiment_name}' not found",
+                error_code=ErrorCode.EXPERIMENT_NOT_FOUND.value,
+                available_experiments=available,
+                hint="Call list_experiments() to see available experiments",
+            )
+
+        return ToolResult.ok(data=schema)

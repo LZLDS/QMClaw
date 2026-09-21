@@ -1,5 +1,317 @@
 # QMClaw 开发进度
 
+## 2026-09-20: 统一量子测控工具集和 API
+
+### 背景
+当前 QMClaw 系统有三个服务可以调用测控实验命令：
+- **agent_service** (3005): 直接调用 LabRAD，执行 `sq.*` 函数
+- **qca_service** (3011): 结构化实验接口，基于 LangChain
+- **hermes_service** (3012): 通用 Agent，需要扩展工具
+
+**问题**：
+1. 工具定义风格不同：agent 用自定义 `Tool` 类，qca 用 LangChain `@tool`
+2. 参数格式不统一：agent 用代码字符串，qca 用结构化参数
+3. 返回格式不一致：各服务返回格式各异
+
+**目标**：统一工具集、统一 API、统一返回格式，支持日常测控实验场景。
+
+### 架构
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Unified Quantum Tools                      │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              ToolRegistry (Singleton)               │    │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌───────────┐ │    │
+│  │  │RunCodeTool  │ │GetQubits   │ │Data Tools │ │    │
+│  │  └─────────────┘ └─────────────┘ └───────────┘ │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+          ▲                ▲                ▲
+          │                │                │
+    ┌─────┴─────┐  ┌─────┴─────┐  ┌────┴────┐
+    │agent_svc   │  │ qca_svc   │  │hermes_svc│
+    │  adapter   │  │  adapter  │  │ MCP Tool │
+    └───────────┘  └───────────┘  └──────────┘
+```
+
+### 已完成
+
+#### Phase 1: 核心框架
+- [x] `services/common/quantum_tools/__init__.py` - 统一导出
+- [x] `services/common/quantum_tools/base.py` - 工具基类和统一返回格式
+  - `ToolResult` - 统一返回格式
+  - `ToolSchema` - 工具 schema
+  - `ParameterSchema` - 参数 schema
+  - `QuantumTool` - 抽象基类
+  - `ExperimentResult` - 实验结果数据结构
+  - `QubitInfo` - 量子比特信息
+- [x] `services/common/quantum_tools/errors.py` - 错误码定义
+  - `ErrorCode` 枚举
+  - `QMClawError` 异常基类
+  - `ValidationError`, `NotFoundError`, `TimeoutError`, `LabRADError` 等
+- [x] `services/common/quantum_tools/registry.py` - 工具注册中心
+  - `ToolRegistry` 类（每次实例化都是新实例，非单例）
+  - `register_tool()` 注册工具
+  - `execute()` 执行工具
+  - `get_definitions()` 返回 OpenAI 格式定义
+  - `get_stats()` 执行统计
+- [x] `services/common/quantum_tools/types.py` - 数据类型定义
+
+#### Phase 2: 核心工具实现
+- [x] `services/common/quantum_tools/execution.py` - 实验执行工具
+  - `RunCodeTool` - 直接执行代码
+  - `RunExperimentTool` - 执行命名实验
+  - `ListExperimentsTool` - 列出实验
+  - `GetExperimentSchemaTool` - 获取实验 schema
+- [x] `services/common/quantum_tools/qubit.py` - 量子比特工具
+  - `GetQubitsTool` - 获取量子比特列表
+  - `GetQubitParamsTool` - 获取量子比特参数
+  - `SetQubitParamsTool` - 设置量子比特参数
+- [x] `services/common/quantum_tools/data.py` - 数据查询工具
+  - `ListHistoryTool` - 查询实验历史
+  - `GetExperimentDataTool` - 获取实验数据
+  - `GetArrayDataTool` - 获取数组数据
+  - `GetStatsTool` - 获取统计数据
+
+#### Phase 3: 服务适配（每个服务独立注册）
+- [x] `services/agent_service/adapter.py` - Agent Service 适配器
+  - `setup_agent_tools()` - 注册工具（直接调用 LabRAD）
+  - `AgentServiceAdapter` 类
+- [x] `services/agent_service/server.py` - 集成统一工具 + `/api/v1/` 路由
+- [x] `services/qca_service/adapter.py` - QCA Service 适配器
+  - `setup_qca_tools()` - 注册工具（HTTP 调用 quantum_service）
+  - `QCAServiceAdapter` 类
+- [x] `services/hermes_service/quantum_toolset.py` - Hermes MCP 工具服务器
+  - `setup_hermes_tools()` - 注册工具（HTTP 调用 quantum_service）
+  - `QuantumMCPServer` 类
+- [x] `services/hermes_service/server.py` - 集成量子工具集 + `/quantum-tools` 端点
+
+### 架构说明
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   智能体服务（通过 HTTP 调用）                      │
+│                                                                  │
+│  agent_service  ──────────────┐                                  │
+│  qca_service    ────────────┼──> quantum_service (:3003)        │
+│  hermes_service ──────────────┘                                  │
+│                                                                  │
+│  负责：自然语言理解、任务规划、工具调用                            │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 直接调用
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   quantum_service                                 │
+│  负责：LabRAD 连接、实验执行、量子比特管理                         │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   LabRAD / 硬件设备                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+每个服务的 ToolRegistry 是独立实例，工具定义相同且都通过 HTTP 调用 quantum_service。
+
+### 统一 API 端点
+
+#### agent_service (3005)
+```
+GET  /api/v1/tools           - 列出所有工具
+GET  /api/v1/tools/{name}   - 获取工具 schema
+POST /api/v1/tools/{name}   - 执行工具
+GET  /api/v1/qubits          - 获取量子比特
+GET  /api/v1/experiments     - 列出实验
+GET  /api/v1/health          - 健康检查
+```
+
+#### hermes_service (3012)
+```
+GET  /quantum-tools          - 列出量子工具
+POST /quantum-tools/execute   - 执行量子工具
+```
+
+### 统一返回格式
+```python
+{
+    "success": true,
+    "data": {...},
+    "error": {
+        "code": "NOT_FOUND",
+        "message": "Resource not found",
+        "hint": "Call GET /qubits to see available"
+    },
+    "request_id": "req_abc123",
+    "timestamp": "2026-09-20T14:30:45Z"
+}
+```
+
+### 待验证
+- [ ] 模块导入测试 (已通过)
+- [ ] 服务启动测试
+- [ ] 工具注册测试
+- [ ] 跨服务 API 一致性测试
+- [ ] hermes_service 量子工具集成测试
+
+---
+
+## 2026-09-17: Quantum/Analysis 服务降级模式
+
+### 背景
+当 LabRAD 或 lqcs 服务不可用时（如 lqcs 中的 Cython/Twisted 兼容性问题），quantum_service 和 analysis_service 应该能够优雅降级，显示本地缓存数据而不是直接崩溃。
+
+### 目标
+- 服务启动失败时不崩溃，进入降级模式
+- 支持重连策略（指数退避）
+- 最大重试次数后停止，显示降级状态
+- 降级模式下返回本地缓存数据
+- 前端显示降级状态和提示信息
+
+### 架构
+```
+                    ┌─────────────────┐
+                    │  Service Start  │
+                    └────────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Try Connect     │
+                    │  LabRAD/lqcs     │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+       ┌──────▼──────┐              ┌───────▼──────┐
+       │  Connected  │              │   Failed     │
+       └──────┬──────┘              └───────┬──────┘
+              │                             │
+       ┌──────▼──────┐              ┌───────▼──────┐
+       │  Healthy    │              │ Degraded Mode │
+       │  Full Func  │              │ + Retry Timer│
+       └─────────────┘              └──────┬───────┘
+                                            │
+                                    (max_attempts 次后停止)
+                                            ▼
+                                    ┌───────────────┐
+                                    │  Permanent    │
+                                    │  Degraded     │
+                                    └───────────────┘
+```
+
+### 配置文件
+```json
+// config/fallback_config.json
+{
+  "quantum_service": {
+    "enabled": true,
+    "fallback_data_path": "data/fallback/quantum",
+    "retry": {
+      "max_attempts": 5,
+      "base_delay": 2,
+      "max_delay": 30
+    }
+  },
+  "analysis_service": {
+    "enabled": true,
+    "fallback_data_path": "data/fallback/analysis",
+    "retry": {...}
+  }
+}
+```
+
+### 已完成
+
+#### 降级状态管理器
+- [x] `services/common/fallback_manager.py` - FallbackManager 类
+  - `ConnectionState` 枚举: DISCONNECTED, CONNECTING, CONNECTED, DEGRADED, DEGRADED_PERMANENT
+  - 重连策略: 指数退避 (`base_delay * 2^attempt`)
+  - 状态变更回调机制
+  - 本地降级数据加载 (`get_fallback_data()`)
+  - 定时器管理 (`start_reconnect_timer()`)
+- [x] `services/common/__init__.py` - 导出 FallbackManager, ConnectionState
+
+#### Quantum Service 降级
+- [x] `services/quantum_service/server.py` 修改
+  - 添加 `_fallback: FallbackManager` 成员
+  - 修改 `before_start()`: 连接失败时进入降级模式，启动重连定时器
+  - 添加 `_do_reconnect()`: 重连回调函数
+  - 添加 `_load_fallback_data()`: 加载降级数据 (qubits.json, experiments.json)
+  - 修改 `_ensure_connected()`: 处理降级状态
+  - 修改 `_handle_health()`: 返回 `fallback_mode`, `fallback_state`, `fallback_message`
+  - 修改 `_handle_connect()`: 支持手动重连
+  - 修改 `_handle_qubits()`: 降级模式下返回本地数据
+  - 修改 `_handle_experiments()`: 降级模式下返回本地数据
+  - 修改 `_handle_execute()`: 降级模式下拒绝执行
+  - 修改其他 handler: 添加降级状态检查
+  - 添加 `_get_fallback_message()`: 生成用户友好的降级提示
+
+#### Analysis Service 降级
+- [x] `services/analysis_service/server.py` 修改
+  - 添加 `_fallback: FallbackManager` 成员
+  - 修改 `before_start()`: 连接失败时进入降级模式
+  - 添加 `_do_reconnect()`: 重连回调函数
+  - 添加 `_load_fallback_data()`: 加载降级数据 (datasets.json)
+  - 修改 `_handle_health()`: 返回降级信息
+  - 修改 `_handle_connect()`: 支持重连
+  - 修改 `_handle_execute()`: 降级模式下拒绝执行
+  - 修改 `_handle_datasets()`: 降级模式下返回本地数据
+  - 添加 `_get_fallback_message()`: 生成降级提示
+
+#### Gateway API 更新
+- [x] `src/index.ts` 修改
+  - 修改 `/hardware/status`: 返回 `fallback` 对象 (mode, state, message)
+  - 修改 `/hardware/quick`: 返回 `fallback` 对象，更新 `labrad` 状态为 "degraded"
+  - 添加日志过滤器标签: `[FallbackManager]`, `[quantum_service]`, `[analysis_service]`
+
+#### 降级数据示例
+- [x] `data/fallback/quantum/qubits.json` - 量子比特示例数据
+- [x] `data/fallback/quantum/experiments.json` - 实验函数示例数据
+- [x] `data/fallback/analysis/datasets.json` - 数据集示例数据
+
+#### 配置文件
+- [x] `config/fallback_config.json` - 降级模式配置
+
+### 前端 API 响应格式
+```typescript
+// GET /hardware/quick
+{
+  labrad: "degraded",
+  llm: "ready",
+  ray: "via_quantum",
+  datavault: "disconnected",
+  fallback: {
+    mode: true,
+    state: "degraded",
+    message: "LabRAD 连接中断，正在尝试重连（3/5）..."
+  },
+  message: "降级模式 - LabRAD 连接中断，正在尝试重连（3/5）..."
+}
+
+// GET /hardware/status
+{
+  overall: "degraded",
+  timestamp: "...",
+  services: {...},
+  devices: {},
+  issues: ["LabRAD not connected"],
+  fallback: {
+    mode: true,
+    state: "degraded_permanent",
+    message: "LabRAD 不可用（已停止重连）。最后错误：连接超时"
+  }
+}
+```
+
+### 待验证
+- [ ] quantum_service 启动测试（正常模式和降级模式）
+- [ ] analysis_service 启动测试
+- [ ] 降级数据加载测试
+- [ ] 重连机制测试（模拟 LabRAD 不可用）
+- [ ] 前端降级状态显示测试
+- [ ] 永久降级状态测试（max_attempts 次重连失败后）
+
+---
+
 ## 2026-09-16: Workflow 历史记录微服务迁移
 
 ### 背景

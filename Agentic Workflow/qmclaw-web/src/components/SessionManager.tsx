@@ -208,7 +208,12 @@ export function CompactSessionManager() {
     try {
       const res = await api.getSessionTree() as { tree: TreeNode[]; error?: string };
       if (res.error) {
-        console.error('[SessionManager] Session tree error:', res.error);
+        // LabRAD 不可用在离线模式下是预期行为，不打印错误
+        if (res.error.includes("LabRAD 不可用")) {
+          console.warn('[SessionManager] LabRAD unavailable (offline mode)');
+        } else {
+          console.error('[SessionManager] Session tree error:', res.error);
+        }
         setSessionTree([]);
       } else {
         setSessionTree(res.tree || []);
@@ -224,7 +229,12 @@ export function CompactSessionManager() {
     try {
       const res = await api.listQubits() as { sessionPath: string[]; error?: string };
       if (res.error) {
-        console.error('[SessionManager] Current path error:', res.error);
+        // LabRAD 不可用在离线模式下是预期行为，不打印错误
+        if (res.error.includes("LabRAD 不可用")) {
+          console.warn('[SessionManager] LabRAD unavailable (offline mode)');
+        } else {
+          console.error('[SessionManager] Current path error:', res.error);
+        }
         setCurrentPath([]);
       } else {
         setCurrentPath(res.sessionPath || []);

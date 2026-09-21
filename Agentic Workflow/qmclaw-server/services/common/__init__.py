@@ -6,6 +6,7 @@ services/common/ - 公共模块
 
 from .logging import setup_logging, log_request, log_response, LogContext
 from .config import Config, config
+from .fallback_manager import FallbackManager, ConnectionState
 from .exceptions import (
     ServiceError,
     ConfigError,
@@ -26,6 +27,9 @@ __all__ = [
     # Config
     "Config",
     "config",
+    # Fallback
+    "FallbackManager",
+    "ConnectionState",
     # Exceptions
     "ServiceError",
     "ConfigError",

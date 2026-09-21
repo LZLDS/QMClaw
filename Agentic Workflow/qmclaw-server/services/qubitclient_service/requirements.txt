@@ -1,0 +1,3 @@
+# QubitClient Service dependencies
+-e ../../../vendor/QubitClient
+openai>=1.0.0

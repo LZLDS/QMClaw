@@ -1,0 +1,9 @@
+[submodule "vendor/Quantum-Calibration-Agent-Blueprint"]
+	path = vendor/Quantum-Calibration-Agent-Blueprint
+	url = https://github.com/Secsix/Quantum-Calibration-Agent-Blueprint
+[submodule "vendor/hermes-agent"]
+	path = vendor/hermes-agent
+	url = https://github.com/Secsix/hermes-agent
+[submodule "vendor/QubitClient"]
+	path = vendor/QubitClient
+	url = https://github.com/Secsix/QubitClient
