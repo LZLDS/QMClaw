@@ -60,7 +60,7 @@ export default function HermesChatPanel() {
         setModels([
           { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax" },
           { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet", provider: "anthropic" },
-          { id: "deepseek-chat", name: "DeepSeek Chat", provider: "deepseek" },
+          { id: "deepseek-flash", name: "DeepSeek V4.1 Flash", provider: "deepseek" },
         ]);
       });
   }, []);

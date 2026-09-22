@@ -35,7 +35,26 @@ if str(_QMCLAW_SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(_QMCLAW_SERVER_DIR))
 
 # Add vendor QCA Blueprint to sys.path
-VENDOR_QCA_DIR = Path(r"D:\Documents\QMClaw\vendor\Quantum-Calibration-Agent-Blueprint")
+def _find_vendor_qca_dir() -> Path:
+    """Locate vendor/Quantum-Calibration-Agent-Blueprint relative to this file.
+
+    The previous absolute path (D:\\Documents\\QMClaw\\...) only existed on the
+    machine this bundle was built on, so the repository root is found by
+    searching upward instead of hardcoding it.
+    """
+    current = Path(__file__).resolve().parent  # qca_service
+    for _ in range(7):
+        candidate = current / "vendor" / "Quantum-Calibration-Agent-Blueprint"
+        if candidate.is_dir():
+            return candidate
+        if current.parent == current:  # reached filesystem root
+            break
+        current = current.parent
+    # Fallback: standard layout (qmclaw-server/services/qca_service/server.py)
+    return Path(__file__).resolve().parents[4] / "vendor" / "Quantum-Calibration-Agent-Blueprint"
+
+
+VENDOR_QCA_DIR = _find_vendor_qca_dir()
 if str(VENDOR_QCA_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_QCA_DIR))
 
@@ -100,24 +119,53 @@ QMCLAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
-# LLM Configuration - Use MiniMax with direct HTTP calls
+# LLM Configuration - OpenAI-compatible chat completions endpoint.
+# The provider is picked from whichever API key is actually configured, so the
+# service works with DeepSeek only, MiniMax only, or OpenAI only.
 # =============================================================================
 
-MINIMAX_API_KEY = os.environ.get("OPENAI_API_KEY", "") or os.environ.get("MINIMAX_API_KEY", "")
-MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
-MINIMAX_MODEL = "MiniMax-Text-01"
+_LLM_CANDIDATES = (
+    # (env var, base url, model)
+    ("DEEPSEEK_API_KEY", "https://api.deepseek.com/v1", "deepseek-flash"),
+    ("MINIMAX_API_KEY", "https://api.minimaxi.com/v1", "MiniMax-Text-01"),
+    ("OPENAI_API_KEY", "https://api.openai.com/v1", "gpt-4o-mini"),
+)
 
-print(f"[QCA] API Key configured: {'Yes' if MINIMAX_API_KEY else 'No (empty)'}")
-print(f"[QCA] API Key preview: {MINIMAX_API_KEY[:15]}..." if MINIMAX_API_KEY else "")
+
+def _resolve_llm_config() -> tuple:
+    """Return (api_key, base_url, model) for the first provider with a key."""
+    for env_var, base_url, model in _LLM_CANDIDATES:
+        key = os.environ.get(env_var, "").strip()
+        if key:
+            return (
+                key,
+                os.environ.get("QCA_BASE_URL", "").strip() or base_url,
+                os.environ.get("QCA_MODEL_NAME", "").strip() or model,
+            )
+    _, base_url, model = _LLM_CANDIDATES[0]
+    return "", base_url, model
 
 
-def _call_minimax(messages: list, temperature: float = 0.7) -> dict:
-    """Direct HTTP call to MiniMax API."""
+LLM_API_KEY, LLM_BASE_URL, LLM_MODEL = _resolve_llm_config()
+
+# Aliases kept for backwards compatibility with the rest of this module.
+MINIMAX_API_KEY = LLM_API_KEY
+MINIMAX_BASE_URL = LLM_BASE_URL
+MINIMAX_MODEL = LLM_MODEL
+
+print(f"[QCA] LLM base URL: {LLM_BASE_URL}")
+print(f"[QCA] LLM model: {LLM_MODEL}")
+print(f"[QCA] API Key configured: {'Yes' if LLM_API_KEY else 'No (empty)'}")
+print(f"[QCA] API Key preview: {LLM_API_KEY[:11]}..." if LLM_API_KEY else "")
+
+
+def _call_llm(messages: list, temperature: float = 0.7) -> dict:
+    """Direct HTTP call to the configured OpenAI-compatible endpoint."""
     import urllib.request
     import urllib.error
 
     payload = {
-        "model": MINIMAX_MODEL,
+        "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": 2048,
@@ -125,11 +173,11 @@ def _call_minimax(messages: list, temperature: float = 0.7) -> dict:
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{MINIMAX_BASE_URL}/chat/completions",
+        f"{LLM_BASE_URL}/chat/completions",
         data=data,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {MINIMAX_API_KEY}",
+            "Authorization": f"Bearer {LLM_API_KEY}",
         },
         method="POST"
     )
@@ -140,33 +188,32 @@ def _call_minimax(messages: list, temperature: float = 0.7) -> dict:
             return result
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
-        print(f"[QCA] MiniMax API error: {e.code} - {error_body}")
+        print(f"[QCA] LLM API error: {e.code} - {error_body}")
         return {"error": f"API error {e.code}: {error_body}"}
     except Exception as e:
-        print(f"[QCA] MiniMax request error: {e}")
+        print(f"[QCA] LLM request error: {e}")
         return {"error": str(e)}
 
 
 def create_chat_model():
-    """Create chat model - use MiniMax (legacy langchain approach)."""
+    """Create chat model via the configured OpenAI-compatible endpoint."""
     from langchain.chat_models import init_chat_model
 
-    model_name = os.environ.get("QCA_MODEL", "minimax:MiniMax-Text-01")
-    base_url = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+    model_name = os.environ.get("QCA_MODEL", LLM_MODEL)
+    base_url = os.environ.get("QCA_BASE_URL", LLM_BASE_URL)
 
     print(f"[QCA] Using model: {model_name}")
     print(f"[QCA] Base URL: {base_url}")
 
     if model_name.startswith("minimax:"):
-        model = model_name[8:]  # strip "minimax:" prefix
-        return init_chat_model(
-            model,
-            model_provider="openai",
-            base_url=base_url,
-            api_key=MINIMAX_API_KEY,
-        )
-    else:
-        return init_chat_model(model_name)
+        model_name = model_name[8:]  # strip legacy "minimax:" prefix
+
+    return init_chat_model(
+        model_name,
+        model_provider="openai",
+        base_url=base_url,
+        api_key=LLM_API_KEY,
+    )
 
 
 # =============================================================================
@@ -256,7 +303,7 @@ def _simple_chat(message: str) -> dict:
         "content": message
     }
 
-    response = _call_minimax([system_prompt, user_message], temperature=0.7)
+    response = _call_llm([system_prompt, user_message], temperature=0.7)
 
     if "error" in response:
         return {"content": f"Error: {response['error']}", "type": "error"}

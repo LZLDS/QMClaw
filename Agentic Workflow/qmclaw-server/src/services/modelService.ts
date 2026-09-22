@@ -114,9 +114,9 @@ export const DEFAULT_MODELS: Omit<LLMModel, 'id' | 'createdAt' | 'updatedAt'>[] 
     config: { temperature: 0.3, maxTokens: 500 },
   },
   {
-    name: 'DeepSeek Chat',
+    name: 'DeepSeek V4.1 Flash',
     provider: 'deepseek',
-    modelId: 'deepseek-chat',
+    modelId: 'deepseek-flash',
     enabled: true,
     capabilities: ['text'],
     config: { temperature: 0.3, maxTokens: 500 },

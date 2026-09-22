@@ -91,9 +91,14 @@ class LLMService(BaseService):
     def _handle_chat(self, data: Dict[str, Any], start_time: float) -> Dict[str, Any]:
         """处理聊天请求"""
         messages = data.get("messages", [])
-        model = data.get("model", "minimax")
+        # Callers are inconsistent: the Express gateway sends camelCase
+        # ("modelId" / "maxTokens" / "baseUrl"), others send "model" /
+        # "max_tokens". Accept both, otherwise the selected model is silently
+        # ignored and every request falls back to MiniMax.
+        model = data.get("model") or data.get("modelId") or data.get("provider") or "minimax"
         temperature = data.get("temperature", 0.7)
-        max_tokens = data.get("max_tokens", 4096)
+        max_tokens = data.get("max_tokens") or data.get("maxTokens") or 4096
+        model_key = str(model).lower()
 
         if not messages:
             return {"error": "messages is required"}
@@ -102,12 +107,12 @@ class LLMService(BaseService):
 
         try:
             # 根据 model 调用不同的 provider
-            if model.startswith("minimax") or model == "minimax":
+            if model_key.startswith("minimax") or model_key == "minimax":
                 result = self._call_minimax(messages, temperature, max_tokens)
-            elif model.startswith("gpt") or model.startswith("openai"):
+            elif model_key.startswith("gpt") or model_key.startswith("openai"):
                 result = self._call_openai(messages, model, temperature, max_tokens)
-            elif model.startswith("deepseek"):
-                result = self._call_deepseek(messages, temperature, max_tokens)
+            elif model_key.startswith("deepseek"):
+                result = self._call_deepseek(messages, temperature, max_tokens, model)
             else:
                 # 默认使用 MiniMax
                 result = self._call_minimax(messages, temperature, max_tokens)
@@ -148,8 +153,8 @@ class LLMService(BaseService):
 
         if config.get("deepseek_api_key"):
             models.append({
-                "id": "deepseek-chat",
-                "name": "DeepSeek Chat",
+                "id": "deepseek-flash",
+                "name": "DeepSeek V4.1 Flash",
                 "provider": "deepseek",
                 "max_tokens": 16384,
             })
@@ -282,7 +287,7 @@ class LLMService(BaseService):
             "raw": result,
         }
 
-    def _call_deepseek(self, messages: List[Dict], temperature: float, max_tokens: int) -> Dict[str, Any]:
+    def _call_deepseek(self, messages: List[Dict], temperature: float, max_tokens: int, model: str = "deepseek-flash") -> Dict[str, Any]:
         """调用 DeepSeek API"""
         import urllib.request
         import urllib.error
@@ -295,7 +300,7 @@ class LLMService(BaseService):
         url = "https://api.deepseek.com/chat/completions"
 
         payload = {
-            "model": "deepseek-chat",
+            "model": model or "deepseek-flash",
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
