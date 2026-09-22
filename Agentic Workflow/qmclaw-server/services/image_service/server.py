@@ -8,6 +8,7 @@ services/image_service/server.py - 图像服务
 """
 
 import json
+import random
 import time
 import threading
 import sys
@@ -23,6 +24,32 @@ from ..common import setup_logging, config
 def _log(msg: str):
     """安全日志输出"""
     _safe_print(f"[image_service] {msg}")
+
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _preprocess_image(path, size=(224, 224), flip: bool = False, brightness: float = None):
+    """把图片读成归一化后的 CHW 浮点张量。
+
+    故意不用 torchvision：本环境只装了 torch 没装 torchvision，所以缩放和归一化
+    用 PIL + numpy 自己完成（训练与推理共用，保证两边预处理一致）。
+    """
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    img = Image.open(path).convert("RGB")
+    if flip:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    img = img.resize(size)
+
+    arr = np.asarray(img, dtype="float32") / 255.0
+    if brightness is not None:
+        arr = np.clip(arr * brightness, 0.0, 1.0)
+    arr = (arr - np.array(_IMAGENET_MEAN, dtype="float32")) / np.array(_IMAGENET_STD, dtype="float32")
+    return torch.from_numpy(arr.transpose(2, 0, 1))
 
 
 # 模型和图像目录
@@ -58,6 +85,10 @@ class ImageService(BaseService):
         # 分类标签
         self._class_names: List[str] = ["good", "bad"]
         self._model_path = MODEL_DIR / "classifier.pth"
+
+        # 分类历史（内存中，供 /classify/stats 统计最近判定结果）
+        self._classification_history: List[Dict[str, Any]] = []
+        self._history_lock = threading.Lock()
 
         # 训练状态
         self._training: bool = False
@@ -110,11 +141,22 @@ class ImageService(BaseService):
                             x = self.classifier(x)
                             return x
 
-                    self._model = SimpleCNN(num_classes=len(self._class_names))
-                    self._model.load_state_dict(torch.load(self._model_path, map_location='cpu'))
+                    checkpoint = torch.load(self._model_path, map_location='cpu')
+
+                    # 训练时会把类别顺序一起存下来，否则 good/bad 可能颠倒
+                    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                        classes = checkpoint.get("classes") or self._class_names
+                        state_dict = checkpoint["state_dict"]
+                    else:  # 兼容只有 state_dict 的旧模型
+                        classes = self._class_names
+                        state_dict = checkpoint
+
+                    self._model = SimpleCNN(num_classes=len(classes))
+                    self._model.load_state_dict(state_dict)
+                    self._class_names = list(classes)
                     self._model.eval()
                     self._model_loaded = True
-                    _log("PyTorch model loaded")
+                    _log(f"PyTorch model loaded (classes={self._class_names})")
 
                 elif self._model_backend == "onnx":
                     import onnxruntime as ort
@@ -134,18 +176,9 @@ class ImageService(BaseService):
             return {"error": "Model not loaded"}
 
         try:
-            from PIL import Image
             import torch
-            from torchvision import transforms
 
-            # 加载并预处理图像
-            img = Image.open(image_path).convert('RGB')
-            transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            img_tensor = transform(img).unsqueeze(0)
+            img_tensor = _preprocess_image(image_path).unsqueeze(0)
 
             # 推理
             with torch.no_grad():
@@ -163,11 +196,30 @@ class ImageService(BaseService):
                 "needs_review": confidence < threshold,
             }
 
+            self._record_classification(image_path, result)
             return result
 
         except Exception as e:
             _log(f"Classification error: {e}\n{traceback.format_exc()}")
             return {"error": str(e)}
+
+    def _record_classification(self, image_path: str, result: Dict[str, Any]) -> None:
+        """记录一次分类结果，供 /classify/stats 统计（仅内存，重启即清空）"""
+        try:
+            with self._history_lock:
+                self._classification_history.append({
+                    "timestamp": time.time(),
+                    "path": str(image_path),
+                    "filename": Path(image_path).name,
+                    "class": result.get("class"),
+                    "confidence": result.get("confidence"),
+                    "needs_review": result.get("needs_review"),
+                })
+                # 只保留最近 500 条，避免无限增长
+                if len(self._classification_history) > 500:
+                    self._classification_history = self._classification_history[-500:]
+        except Exception as exc:
+            _log(f"WARNING: failed to record classification: {exc}")
 
     def _classify_folder(self, folder_path: str, threshold: float = 0.75, margin: float = 0.15) -> Dict[str, Any]:
         """批量分类文件夹中的图像"""
@@ -225,27 +277,27 @@ class ImageService(BaseService):
             try:
                 import torch
                 import torch.nn as nn
-                from torch.utils.data import DataLoader, ImageFolder
-                from torchvision import transforms
 
                 _log(f"Starting training: epochs={epochs}, batch_size={batch_size}")
 
-                # 数据增强
-                transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.RandomRotation(10),
-                    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ])
+                # 类别目录名即类名（等价于 torchvision 的 ImageFolder，但不依赖它）
+                classes = sorted(d.name for d in train_dir.iterdir() if d.is_dir())
+                if not classes:
+                    raise RuntimeError(f"No class sub-folders found under {train_dir}")
 
-                # 加载数据
-                dataset = ImageFolder(str(train_dir), transform=transform)
-                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                samples = []
+                for cls in classes:
+                    for p in sorted((train_dir / cls).iterdir()):
+                        if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}:
+                            samples.append((p, classes.index(cls)))
 
-                num_classes = len(dataset.classes)
-                self._class_names = dataset.classes
+                if not samples:
+                    raise RuntimeError(f"No images found under {train_dir}")
+
+                _log(f"Training samples: {len(samples)}, classes: {classes}")
+
+                num_classes = len(classes)
+                self._class_names = classes
 
                 # 创建模型
                 class SimpleCNN(nn.Module):
@@ -280,7 +332,7 @@ class ImageService(BaseService):
                 # 损失函数（处理类别不平衡）
                 if imbalance_mode == "weighted":
                     class_counts = [0] * num_classes
-                    for _, label in dataset.samples:
+                    for _, label in samples:
                         class_counts[label] += 1
                     weights = [1.0 / c if c > 0 else 1.0 for c in class_counts]
                     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights))
@@ -292,11 +344,26 @@ class ImageService(BaseService):
                 # 训练循环
                 for epoch in range(epochs):
                     model.train()
+                    random.shuffle(samples)
                     total_loss = 0.0
                     correct = 0
                     total = 0
+                    n_batches = max(1, (len(samples) + batch_size - 1) // batch_size)
 
-                    for batch_idx, (images, labels) in enumerate(dataloader):
+                    for batch_idx in range(n_batches):
+                        batch = samples[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+
+                        # 轻量数据增强：随机水平翻转 + 随机亮度
+                        images = torch.stack([
+                            _preprocess_image(
+                                p,
+                                flip=random.random() < 0.5,
+                                brightness=random.uniform(0.8, 1.2) if random.random() < 0.5 else None,
+                            )
+                            for p, _ in batch
+                        ])
+                        labels = torch.tensor([label for _, label in batch], dtype=torch.long)
+
                         optimizer.zero_grad()
                         outputs = model(images)
                         loss = criterion(outputs, labels)
@@ -308,16 +375,16 @@ class ImageService(BaseService):
                         total += labels.size(0)
                         correct += (predicted == labels).sum().item()
 
-                        self._training_progress = (epoch + (batch_idx + 1) / len(dataloader)) / epochs
+                        self._training_progress = (epoch + (batch_idx + 1) / n_batches) / epochs
 
                     accuracy = 100 * correct / total
-                    avg_loss = total_loss / len(dataloader)
+                    avg_loss = total_loss / n_batches
                     _log(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
 
-                # 保存模型
+                # 保存模型（连同类别顺序一起存，加载时才能正确对应 good/bad）
                 model.eval()
-                torch.save(model.state_dict(), self._model_path)
-                _log(f"Model saved to {self._model_path}")
+                torch.save({"state_dict": model.state_dict(), "classes": classes}, self._model_path)
+                _log(f"Model saved to {self._model_path} (classes={classes})")
 
                 self._model = model
                 self._model_loaded = True
@@ -348,8 +415,80 @@ class ImageService(BaseService):
             return self._handle_model_info()
         elif path == "/training/status":
             return self._handle_training_status()
+        # 注意：Express 网关实际转发的是 /stats 和 /classify/latest，
+        # 这里把更直白的 /classify/stats、/classify/latest-experiment 也一并支持。
+        elif path in ("/stats", "/classify/stats"):
+            return self._handle_classify_stats(query)
+        elif path in ("/classify/latest", "/classify/latest-experiment"):
+            return self._handle_classify_latest_experiment(data)
         else:
             raise ValueError(f"Unknown path: {path}")
+
+    def _handle_classify_stats(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
+        """最近一段时间的分类统计（前端「分类统计」面板）"""
+        since_hours = 24.0
+        if query.get("sinceHours"):
+            try:
+                since_hours = float(query["sinceHours"][0])
+            except (TypeError, ValueError):
+                pass
+
+        cutoff = time.time() - since_hours * 3600
+        with self._history_lock:
+            recent = [h for h in self._classification_history if h["timestamp"] >= cutoff]
+
+        stats = {"good": 0, "bad": 0, "review": 0}
+        for item in recent:
+            if item.get("needs_review"):
+                stats["review"] += 1
+            elif item.get("class") == "good":
+                stats["good"] += 1
+            else:
+                stats["bad"] += 1
+
+        return {
+            "sinceHours": since_hours,
+            "total": len(recent),
+            "stats": stats,
+            "modelLoaded": self._model_loaded,
+            "modelExists": self._model_path.exists(),
+            "recent": recent[-20:][::-1],
+        }
+
+    def _handle_classify_latest_experiment(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """分类最近一次实验出的图（优先按 qubit 名匹配文件名）"""
+        if not self._load_model():
+            return {"error": "Model not loaded. Train a model first (POST /train)."}
+
+        qubit = (data.get("qubit") or "").strip()
+        threshold = data.get("reviewThreshold", data.get("threshold", 0.75))
+
+        base = Path(__file__).parent.parent.parent.parent
+        search_dirs = [base / "qmclaw-web" / "public" / "plots", IMAGE_DIR]
+        extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
+
+        candidates = []
+        for folder in search_dirs:
+            if folder.is_dir():
+                candidates += [f for f in folder.iterdir() if f.suffix.lower() in extensions]
+
+        if not candidates:
+            return {"error": "No experiment images found", "searched": [str(d) for d in search_dirs]}
+
+        pool = [f for f in candidates if qubit.lower() in f.name.lower()] if qubit else []
+        latest = max(pool or candidates, key=lambda f: f.stat().st_mtime)
+
+        result = self._classify_image(str(latest), threshold)
+        if "error" in result:
+            return result
+
+        result.update({
+            "filename": latest.name,
+            "path": str(latest),
+            "qubit": qubit or None,
+            "matched_qubit": bool(qubit and qubit.lower() in latest.name.lower()),
+        })
+        return result
 
     def _handle_health(self) -> Dict[str, Any]:
         """健康检查"""
