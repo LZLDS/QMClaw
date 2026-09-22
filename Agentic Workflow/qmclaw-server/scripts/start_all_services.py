@@ -253,22 +253,15 @@ def wait_for_services(timeout: int = 60):
             port = svc_config.get("port", SERVICES[name]["port"] if name in SERVICES else 0)
             url = f"http://localhost:{port}/health"
 
+            status_code = None
             try:
                 req = urllib.request.Request(url)
                 with urllib.request.urlopen(req, timeout=2) as response:
                     status_code = response.status
-                    # 接受 200 (healthy) 或 503 (degraded/running) 作为"就绪"
-                    if status_code in (200, 503):
-                        if service_status[name] != "ready":
-                            # 根据状态码显示不同信息
-                            if status_code == 200:
-                                print(f"[start_all] ✅ {name}: Ready (port {port})")
-                            else:
-                                print(f"[start_all] ⚠️  {name}: Running in degraded mode (port {port})")
-                            service_status[name] = "ready"
-                    else:
-                        all_ready = False
-                        any_running = True
+            except urllib.error.HTTPError as e:
+                # urlopen() raises on any non-2xx response, so a 503 (alive but
+                # degraded) has to be read off the exception, not the response.
+                status_code = e.code
             except urllib.error.URLError as e:
                 all_ready = False
                 reason = str(e.reason)
@@ -289,6 +282,20 @@ def wait_for_services(timeout: int = 60):
                     print(f"[start_all] ⏳ {name}: Waiting... ({type(e).__name__})")
                     error_printed[name] = True
                 service_status[name] = "waiting"
+
+            # 接受 200 (healthy) 或 503 (degraded/running) 作为"就绪"
+            if status_code in (200, 503):
+                any_running = True
+                if service_status[name] != "ready":
+                    # 根据状态码显示不同信息
+                    if status_code == 200:
+                        print(f"[start_all] ✅ {name}: Ready (port {port})")
+                    else:
+                        print(f"[start_all] ⚠️  {name}: Running in degraded mode (port {port})")
+                    service_status[name] = "ready"
+            elif status_code is not None:
+                all_ready = False
+                any_running = True
 
         # 检查是否可以认为服务已就绪
         # 如果所有服务要么已就绪，要么被熔断器阻止（服务本身在运行），则认为成功
@@ -401,14 +408,18 @@ def main():
 
     # 保持运行，监控进程状态
     try:
+        # 已报告过退出的进程，避免每秒重复刷屏
+        reported_exits = set()
+
         # 等待所有进程
         while True:
-            for proc in processes:
-                if proc and proc.poll() is not None:
-                    # 进程已退出，检查是否有错误输出
-                    returncode = proc.returncode
-                    print(f"\n[start_all] ⚠️  Process {proc.pid} exited with code {returncode}")
-                    print(f"[start_all] Please check the output above for errors")
+            for name, info in process_info.items():
+                proc = info.get("proc")
+                if proc and proc.poll() is not None and proc.pid not in reported_exits:
+                    reported_exits.add(proc.pid)
+                    print(f"\n[start_all] ⚠️  {name} (PID {proc.pid}) exited with code {proc.returncode}")
+                    # 子进程输出由上面的打印线程带 [name] 前缀输出，直接指路
+                    print(f"[start_all] See the [{name}] lines above for its output")
 
             # 检查是否所有进程都退出了
             if all(p.poll() is not None for p in processes if p):

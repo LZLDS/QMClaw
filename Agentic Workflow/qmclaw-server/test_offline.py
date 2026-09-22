@@ -62,7 +62,7 @@ for f in test_files:
     print()
 
 # Scan actual files
-data_path = Path("D:/Documents/QMClaw/Agentic Workflow/offline_data")
+data_path = Path(__file__).resolve().parent / "data" / "offline_data"
 datasets = []
 
 for date_dir in sorted(data_path.iterdir()):

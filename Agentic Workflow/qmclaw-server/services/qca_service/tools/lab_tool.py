@@ -14,8 +14,27 @@ from typing import Any, Optional
 from langchain_core.tools import tool
 
 # Add vendor directory to path for imports
-VENDOR_DIR = Path(r"D:\Documents\QMClaw\vendor\Quantum-Calibration-Agent-Blueprint")
 import sys
+
+
+def _find_vendor_dir() -> Path:
+    """Locate vendor/Quantum-Calibration-Agent-Blueprint relative to this file.
+
+    Replaces a hardcoded build-machine path so the repository can be moved.
+    """
+    current = Path(__file__).resolve().parent  # tools
+    for _ in range(8):
+        candidate = current / "vendor" / "Quantum-Calibration-Agent-Blueprint"
+        if candidate.is_dir():
+            return candidate
+        if current.parent == current:  # reached filesystem root
+            break
+        current = current.parent
+    # Fallback: standard layout (qmclaw-server/services/qca_service/tools/lab_tool.py)
+    return Path(__file__).resolve().parents[5] / "vendor" / "Quantum-Calibration-Agent-Blueprint"
+
+
+VENDOR_DIR = _find_vendor_dir()
 if str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
 
@@ -24,7 +43,11 @@ from core import discovery, models
 from core.models import ExperimentSchema, ParameterSpec, ExperimentResult
 
 # QMClaw-specific imports
-from .runner import run_experiment as qca_run_experiment
+# NOTE: there is no tools/runner.py; the QMClaw runner lives in
+# services/qca_service/core/runner.py. Import it by absolute package path so the
+# module resolves both as ``services.qca_service.tools.lab_tool`` and as the
+# top-level ``tools.lab_tool`` (qmclaw-server is always on sys.path).
+from services.qca_service.core.runner import run_experiment as qca_run_experiment
 
 # Paths - use vendor's directories
 VENDOR_DATA_DIR = VENDOR_DIR / "data"

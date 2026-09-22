@@ -72,7 +72,7 @@ def get_service_status() -> Dict[str, Any]:
 
     # 检查其他端口
     ports_to_check = [
-        (3001, "web"),
+        (8081, "web"),
         (3002, "express"),
     ]
 
