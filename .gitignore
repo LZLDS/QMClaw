@@ -45,3 +45,11 @@ Thumbs.db
 *.bak
 *.tmp
 .pytest_cache/
+
+# --- 本地新增：环境相关的大文件/生成物，不纳入版本库 ---
+# vendor 本来是上游的 submodule，这里是 vendor.zip 解出来的普通副本（198 MB）
+vendor/
+# 训练出来的分类模型（可用界面上的「训练」按钮重新生成）
+Agentic Workflow/models/
+# Hermes Agent 的运行时数据（state.db、日志等）
+.hermes/
