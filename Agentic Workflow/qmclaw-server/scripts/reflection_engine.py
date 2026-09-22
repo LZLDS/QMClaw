@@ -40,11 +40,26 @@ def _get_api_key_for_provider(provider: str) -> str:
 def _call_llm_for_reflection(
     system_prompt: str,
     user_message: str,
-    model: str = "gpt-4o-mini",
-    provider: str = "openai"
+    model: str = None,
+    provider: str = None
 ) -> str:
-    """调用 LLM 生成反思内容"""
+    """调用 LLM 生成反思内容
+
+    按实际配置的 API key 选择 provider：DeepSeek 优先（本项目常常只配了这一个），
+    其次 OpenAI，最后回退 MiniMax。
+    """
     try:
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if deepseek_key and provider in (None, "", "deepseek"):
+            return _call_openai_compatible_reflection(
+                system_prompt,
+                user_message,
+                deepseek_key,
+                os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+                model or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
+            )
+
+        provider = provider or "openai"
         api_key = _get_api_key_for_provider(provider)
         if not api_key:
             # 尝试 MiniMax
@@ -53,12 +68,50 @@ def _call_llm_for_reflection(
 
         if provider == "minimax":
             return _call_minimax_reflection(system_prompt, user_message, api_key)
-        else:
-            return _call_openai_reflection(system_prompt, user_message, api_key, model)
+        return _call_openai_reflection(system_prompt, user_message, api_key, model or "gpt-4o-mini")
 
     except Exception as e:
         print(f"ReflectionEngine: LLM call failed: {e}")
         return f"[反思生成失败: {e}]"
+
+
+def _call_openai_compatible_reflection(
+    system_prompt: str,
+    user_message: str,
+    api_key: str,
+    base_url: str,
+    model: str
+) -> str:
+    """通过任意 OpenAI 兼容的 /chat/completions 端点调用（DeepSeek 等）"""
+    from urllib.request import Request, urlopen
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    }
+
+    req = Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urlopen(req, timeout=90) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+
+    choices = result.get("choices", [])
+    if choices:
+        return choices[0].get("message", {}).get("content", "") or ""
+    return ""
 
 
 def _call_openai_reflection(system_prompt: str, user_message: str, api_key: str, model: str) -> str:

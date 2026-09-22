@@ -273,9 +273,16 @@ def get_skill(skill_id: str) -> Optional[Dict]:
 
 
 def list_skills(status: str = None) -> List[Dict]:
-    """列出所有技能"""
+    """列出所有技能
+
+    索引里可能残留指向已丢失文件的悬空条目（例如迁移时只带走了 index.json），
+    这里跳过它们，避免前端显示点不开的记录。
+    """
     index = _load_index()
-    skills = index.get("skills", [])
+    skills = [
+        s for s in index.get("skills", [])
+        if os.path.exists(os.path.join(SKILLS_DIR, f"{s['id']}.json"))
+    ]
 
     if status:
         # 需要加载详情检查状态
@@ -347,11 +354,24 @@ def delete_skill(skill_id: str) -> bool:
 # ── 统计 ──────────────────────────────────────────────────────────────
 
 def get_memory_stats() -> Dict:
-    """获取记忆统计"""
+    """获取记忆统计
+
+    只统计磁盘上确实存在的记录：索引里可能残留指向已丢失文件的悬空条目
+    （例如迁移/打包时只带走了 index.json），那些不应计入。
+    """
     index = _load_index()
 
-    episode_count = len(index.get("episodes", []))
-    skill_count = len(index.get("skills", []))
+    episode_ids = [
+        e["id"] for e in index.get("episodes", [])
+        if os.path.exists(os.path.join(EPISODES_DIR, f"{e['id']}.json"))
+    ]
+    skill_ids = [
+        s["id"] for s in index.get("skills", [])
+        if os.path.exists(os.path.join(SKILLS_DIR, f"{s['id']}.json"))
+    ]
+
+    episode_count = len(episode_ids)
+    skill_count = len(skill_ids)
 
     # 计算存储大小
     total_size = 0
@@ -362,8 +382,9 @@ def get_memory_stats() -> Dict:
                 if os.path.isfile(fp):
                     total_size += os.path.getsize(fp)
 
-    # 成功率统计
-    episodes = index.get("episodes", [])
+    # 成功率统计（同样只算实际存在的记录）
+    valid = set(episode_ids)
+    episodes = [e for e in index.get("episodes", []) if e.get("id") in valid]
     success_count = sum(1 for e in episodes if e.get("status") == "success")
     success_rate = success_count / len(episodes) if episodes else 0
 

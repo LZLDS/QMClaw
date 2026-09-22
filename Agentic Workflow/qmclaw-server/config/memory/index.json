@@ -1,6 +1,20 @@
 {
   "episodes": [
     {
+      "id": "ep_20260921_171154_11075fed",
+      "timestamp": "2026-09-21T17:11:54.930316",
+      "qubit": null,
+      "status": "success",
+      "task_preview": "你好"
+    },
+    {
+      "id": "ep_20260921_170622_7e4dfd27",
+      "timestamp": "2026-09-21T17:06:22.677357",
+      "qubit": null,
+      "status": "success",
+      "task_preview": "你好，请用一句话说明你能帮我做什么。"
+    },
+    {
       "id": "ep_20260903_200223_2b691ed4",
       "timestamp": "2026-09-03T20:02:23.057327",
       "qubit": null,
@@ -29,5 +43,5 @@
       "status": "active"
     }
   ],
-  "last_updated": "2026-09-03T20:02:33.847441"
+  "last_updated": "2026-09-21T17:11:54.932261"
 }

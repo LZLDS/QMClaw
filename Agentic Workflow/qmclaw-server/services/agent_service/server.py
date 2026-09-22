@@ -9,6 +9,7 @@ services/agent_service/server.py - Agent 服务
 """
 
 import json
+import os
 import time
 import threading
 import sys
@@ -16,6 +17,7 @@ import traceback
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config
@@ -28,6 +30,49 @@ from .adapter import AgentServiceAdapter, setup_agent_tools
 def _log(msg: str):
     """安全日志输出"""
     _safe_print(f"[agent_service] {msg}")
+
+
+def _resolve_default_model() -> str:
+    """Pick a model id the llm_service can actually serve.
+
+    The default used to be hardcoded to "minimax", which fails whenever no
+    MINIMAX_API_KEY is configured even though another provider is available.
+    """
+    for env_var, model in (
+        ("DEEPSEEK_API_KEY", "deepseek-flash"),
+        ("MINIMAX_API_KEY", "minimax"),
+        ("OPENAI_API_KEY", "gpt-4o-mini"),
+    ):
+        if os.environ.get(env_var, "").strip():
+            return model
+    return os.environ.get("LLM_DEFAULT_MODEL", "").strip() or "minimax"
+
+
+_DEFAULT_MODEL = _resolve_default_model()
+
+
+# ── 长期记忆 / 自我反思 ────────────────────────────────────────────────────────
+# 存储实现在 scripts/memory_store.py 与 scripts/reflection_engine.py。
+# 注意 reflection_engine 用 `from memory_store import ...` 顶层导入，所以必须先把
+# scripts 目录放进 sys.path 再导入。
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+
+_memory_modules = None
+
+
+def _load_memory_modules():
+    """首次使用时再导入记忆模块，导入失败不影响服务其它功能。"""
+    global _memory_modules
+    if _memory_modules is None:
+        scripts = str(_SCRIPTS_DIR)
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import memory_store
+        import reflection_engine
+
+        _memory_modules = (memory_store, reflection_engine)
+        _log(f"Memory modules loaded from {_SCRIPTS_DIR}")
+    return _memory_modules
 
 
 class TaskStatus(Enum):
@@ -196,14 +241,14 @@ class AgentService(BaseService):
         self._tools[tool.name] = tool
         _log(f"Registered tool: {tool.name}")
 
-    def _call_llm(self, messages: List[Dict], model: str = "minimax", temperature: float = 0.7) -> Dict[str, Any]:
+    def _call_llm(self, messages: List[Dict], model: Optional[str] = None, temperature: float = 0.7) -> Dict[str, Any]:
         """调用 LLM 服务"""
         import urllib.request
         import urllib.error
 
         payload = {
             "messages": messages,
-            "model": model,
+            "model": model or _DEFAULT_MODEL,
             "temperature": temperature,
             "max_tokens": 4096,
         }
@@ -223,7 +268,7 @@ class AgentService(BaseService):
         except Exception as e:
             return {"error": str(e)}
 
-    def _react_reason(self, task: AgentTask) -> Dict[str, Any]:
+    def _react_reason(self, task: AgentTask, model: Optional[str] = None) -> Dict[str, Any]:
         """ReAct 推理循环"""
         max_iterations = 10
         iteration = 0
@@ -239,7 +284,7 @@ class AgentService(BaseService):
             _log(f"ReAct iteration {iteration}/{max_iterations}")
 
             # 调用 LLM
-            response = self._call_llm(messages)
+            response = self._call_llm(messages, model=model)
             if "error" in response:
                 return {"error": response["error"]}
 
@@ -331,8 +376,151 @@ class AgentService(BaseService):
             return self._handle_task_status(data)
         elif path == "/tools":
             return self._handle_tools()
+        elif path.startswith("/memory/"):
+            return self._handle_memory(path, method, data)
         else:
             raise ValueError(f"Unknown path: {path}")
+
+    # ── 长期记忆 / 自我反思路由 ────────────────────────────────────────────────
+    # 前端 MemoryPanel 的字段约定：
+    #   列表 -> {episodes:[...]} / {skills:[...]}
+    #   详情 -> {episode:{...}}       （有外层包裹！）
+    #   统计 -> 直接返回对象本身      （无包裹，前端读 stats.episodeCount）
+    #   反思 -> {report:"<文本>"}     （前端直接 alert 这段文本）
+    def _handle_memory(self, path: str, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        memory_store, reflection_engine = _load_memory_modules()
+
+        if path == "/memory/episodes" and method == "POST":
+            limit = int(data.get("limit") or 50)
+            episodes = memory_store.list_episodes(
+                limit=limit,
+                qubit=data.get("qubit") or None,
+                status=data.get("status") or None,
+            )
+            # 列表里就要显示反思评分/摘要，所以顺带把 reflection 附上
+            enriched = []
+            for item in episodes:
+                full = memory_store.get_episode(item["id"]) or {}
+                entry = dict(item)
+                if full.get("reflection"):
+                    entry["reflection"] = full["reflection"]
+                entry["mode"] = full.get("mode")
+                entry["tags"] = full.get("tags", [])
+                enriched.append(entry)
+            return {"episodes": enriched, "count": len(enriched)}
+
+        if path == "/memory/skills" and method == "GET":
+            skills = memory_store.list_skills()
+            return {"skills": skills, "count": len(skills)}
+
+        if path == "/memory/stats" and method == "GET":
+            return memory_store.get_memory_stats()
+
+        if path == "/memory/recall" and method == "POST":
+            task = (data.get("task") or "").strip()
+            if not task:
+                return {"error": "task is required"}
+            return reflection_engine.recall_for_task(task, qubit=data.get("qubit") or None)
+
+        if path == "/memory/reflect" and method == "POST":
+            return self._handle_memory_reflect(data, memory_store, reflection_engine)
+
+        if path.startswith("/memory/episodes/"):
+            episode_id = path[len("/memory/episodes/"):]
+            if method == "GET":
+                episode = memory_store.get_episode(episode_id)
+                if not episode:
+                    return {"error": f"Episode not found: {episode_id}"}
+                return {"episode": episode}
+            if method == "DELETE":
+                ok = memory_store.archive_episode(episode_id)
+                return {"success": ok, "message": "archived" if ok else "not found"}
+
+        if path.startswith("/memory/skills/"):
+            skill_id = path[len("/memory/skills/"):]
+            if method == "GET":
+                skill = memory_store.get_skill(skill_id)
+                if not skill:
+                    return {"error": f"Skill not found: {skill_id}"}
+                return {"skill": skill}
+            if method == "DELETE":
+                ok = memory_store.delete_skill(skill_id)
+                return {"success": ok, "message": "deleted" if ok else "not found"}
+
+        return {"error": f"Unknown memory path: {method} {path}"}
+
+    def _handle_memory_reflect(self, data: Dict[str, Any], memory_store, reflection_engine) -> Dict[str, Any]:
+        """对已有 Episode 反思；未给 episode_id 时按 task 新建一条再反思。"""
+        result_data = data.get("result_data") or {}
+        episode_id = data.get("episode_id") or result_data.get("episode_id")
+
+        if episode_id:
+            episode = memory_store.get_episode(episode_id)
+            if not episode:
+                return {"error": f"Episode not found: {episode_id}"}
+
+            reflection = reflection_engine.analyze_task(
+                task=episode.get("task", ""),
+                status=episode.get("status", "unknown"),
+                steps=episode.get("steps", []),
+                metrics=episode.get("metrics", {}) or {},
+                qubit=episode.get("qubit"),
+                mode=episode.get("mode", "react"),
+            )
+            memory_store.update_episode_reflection(episode_id, reflection)
+            return {
+                "success": True,
+                "episode_id": episode_id,
+                "reflection": reflection,
+                "report": reflection_engine.format_reflection_report(
+                    {"episode": episode, "reflection": reflection}
+                ),
+            }
+
+        task = (data.get("task") or result_data.get("task") or "").strip()
+        if not task:
+            return {"error": "episode_id or task is required"}
+
+        result = reflection_engine.reflect_after_task(
+            task=task,
+            status=result_data.get("status", "success"),
+            steps=result_data.get("steps", []) or [],
+            metrics=result_data.get("metrics", {}) or {},
+            qubit=result_data.get("qubit"),
+            mode=result_data.get("mode", "react"),
+        )
+        result["success"] = True
+        result["report"] = reflection_engine.format_reflection_report(result)
+        return result
+
+    def _record_episode(self, task: "AgentTask", result: Dict[str, Any]) -> None:
+        """任务结束后把这次执行记入长期记忆（不调用 LLM，反思由面板按需触发）。"""
+        try:
+            memory_store, _ = _load_memory_modules()
+
+            steps = []
+            for msg in result.get("messages", []) or []:
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content") or ""
+                tool = None
+                for line in content.splitlines():
+                    if line.startswith("Action:"):
+                        tool = line.replace("Action:", "").strip().split("(")[0].strip()
+                        break
+                steps.append({"tool": tool, "thought": content[:500], "observation": None})
+
+            memory_store.create_episode(
+                task=task.message,
+                steps=steps,
+                status="success" if result.get("success") else "failed",
+                metrics={"iterations": result.get("iterations", 0)},
+                qubit=(task.context or {}).get("qubit"),
+                tags=[task.mode],
+                mode=task.mode,
+            )
+        except Exception as exc:  # 记忆写入失败绝不能影响对话
+            _log(f"WARNING: failed to record episode: {exc}")
 
     def _handle_api_v1(self, path: str, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """处理 API v1 请求"""
@@ -448,13 +636,14 @@ class AgentService(BaseService):
         try:
             # 执行推理
             if mode == "react":
-                result = self._react_reason(task)
+                result = self._react_reason(task, model=model)
             else:
                 result = {"error": f"Unknown mode: {mode}"}
 
             task.status = TaskStatus.COMPLETED if result.get("success") else TaskStatus.FAILED
             task.result = result
             task.completed_at = time.time()
+            self._record_episode(task, result)
 
             return {
                 "success": result.get("success", False),
@@ -476,6 +665,7 @@ class AgentService(BaseService):
         """处理流式聊天（简单版本，实际使用 SSE）"""
         # 对于 HTTP 轮询模式，返回任务 ID
         message = data.get("message")
+        model = data.get("model")
         mode = data.get("mode", "react")
         task_id = f"task_{int(time.time() * 1000)}"
 
@@ -497,13 +687,14 @@ class AgentService(BaseService):
         def run_task():
             try:
                 if mode == "react":
-                    result = self._react_reason(task)
+                    result = self._react_reason(task, model=model)
                 else:
                     result = {"error": f"Unknown mode: {mode}"}
 
                 task.status = TaskStatus.COMPLETED if result.get("success") else TaskStatus.FAILED
                 task.result = result
                 task.completed_at = time.time()
+                self._record_episode(task, result)
             except Exception as e:
                 task.status = TaskStatus.FAILED
                 task.error = str(e)
