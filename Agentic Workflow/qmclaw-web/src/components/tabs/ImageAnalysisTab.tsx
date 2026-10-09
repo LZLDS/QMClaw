@@ -14,6 +14,12 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '@/lib/api';
+import {
+  matchFamily,
+  buildFamilyCandidates,
+  type FamilyLike,
+} from '@/lib/experimentFamily';
+import type { PickedDataset } from '@/components/DataVaultPicker';
 import type {
   ExperimentFamily,
   FullAnalysisResult,
@@ -33,7 +39,12 @@ interface AnalysisResult {
   q6_evaluate?: EvaluateStatusResult | string;
 }
 
-export default function ImageAnalysisTab() {
+export default function ImageAnalysisTab({
+  pickedDataset,
+}: {
+  /** 由左栏（page.tsx 侧栏）的 DATAVAULT/OFFLINE 选择器推入；变化即绘图 */
+  pickedDataset?: PickedDataset | null;
+} = {}) {
   // 状态
   const [image, setImage] = useState<string | null>(null); // base64
   const [imagePreview, setImagePreview] = useState<string | null>(null);
@@ -46,8 +57,22 @@ export default function ImageAnalysisTab() {
   const [results, setResults] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'single' | 'full'>('full');
+  // DATAVAULT/OFFLINE：选中即出图
+  const [plotLoading, setPlotLoading] = useState(false);
+  const [pickNotice, setPickNotice] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 绘图请求序号：用于淘汰过期的绘图响应
+  const plotSeqRef = useRef(0);
+  // 待匹配的实验类型（绘图成功后写入，families 到位后再匹配，避免重复绘图）
+  const [lastPlot, setLastPlot] = useState<{
+    name: string;
+    expTypes: (string | undefined)[];
+  } | null>(null);
+  // 下面三个 ref 让回调/effect 始终读到最新值，而不必把它们塞进依赖数组
+  const familiesRef = useRef<FamilyLike[]>([]);
+  const selectedFamilyRef = useRef<string>('drag');
+  const pickHandlerRef = useRef<(ds: PickedDataset) => void>(() => {});
 
   // 加载初始化数据
   useEffect(() => {
@@ -172,10 +197,103 @@ export default function ImageAnalysisTab() {
     setImagePreview(null);
     setResults(null);
     setError(null);
+    setPickNotice(null);
+    setLastPlot(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   }, []);
+
+  // ── DATAVAULT/OFFLINE：选中数据集即出图（不自动触发 VLM 分析）──────────────
+  // 绘图产物不是按 jobId 寻址的：两个绘图接口都直接返回 base64 图像
+  //   - 离线 api.plotOfflineDatasetV2({ dataset_id, command })
+  //   - 在线 api.plotExperimentDataset(name, path)
+  const handlePickDataset = useCallback(async (ds: PickedDataset) => {
+    // 连点多个数据集时，只认最后一次选中的结果，避免慢响应覆盖新图
+    const seq = ++plotSeqRef.current;
+    setPlotLoading(true);
+    setPickNotice(null);
+    setError(null);
+
+    try {
+      let res: any;
+
+      if (ds.mode === 'offline') {
+        res = await api.plotOfflineDatasetV2({
+          dataset_id: ds.id,
+          command: 'qter.fitData(do_plot=True)',
+        });
+      } else {
+        if (!ds.path) {
+          setPickNotice(`⚠️ 数据集缺少 path，无法绘图：${ds.name}`);
+          return;
+        }
+        res = await api.plotExperimentDataset(ds.name, ds.path);
+      }
+
+      if (seq !== plotSeqRef.current) return; // 已选中别处，丢弃本次结果
+
+      if (res?.success && res.image) {
+        // 图塞进原有的拖拽框（复用既有两个 state，不动拖拽路径）
+        setImage(res.image);
+        setImagePreview(res.image);
+        setResults(null);
+        // 实验类型匹配交给下面的 effect：families 可能还没加载完
+        setLastPlot({
+          name: ds.name,
+          expTypes: [res.experiment_type, res.exp_type, ds.experiment_type],
+        });
+        if (familiesRef.current.length === 0) {
+          setPickNotice(`✅ 已绘图，正在等待实验类型列表：${ds.name}`);
+        }
+      } else {
+        setLastPlot(null);
+        setPickNotice(`❌ 绘图失败：${res?.error || '未知错误'}（${ds.name}）`);
+      }
+    } catch (e: any) {
+      if (seq !== plotSeqRef.current) return;
+      setLastPlot(null);
+      setPickNotice(`❌ 绘图失败：${e?.message || String(e)}（${ds.name}）`);
+    } finally {
+      if (seq === plotSeqRef.current) setPlotLoading(false);
+    }
+  }, []);
+
+  // 同步 ref（声明在下面两个 effect 之前，保证同一次 commit 内先于它们执行）
+  useEffect(() => {
+    familiesRef.current = families as FamilyLike[];
+    selectedFamilyRef.current = selectedFamily;
+    pickHandlerRef.current = handlePickDataset;
+  });
+
+  // 选中数据集后自动匹配实验类型（等 families 加载完再匹配，只跑一次）
+  useEffect(() => {
+    if (!lastPlot) return;
+    if (families.length === 0) return;
+
+    const fam = matchFamily(
+      buildFamilyCandidates(lastPlot.expTypes, lastPlot.name),
+      families as FamilyLike[]
+    );
+
+    if (fam) {
+      setSelectedFamily(fam.id);
+      setPickNotice(`✅ ${lastPlot.name} → 已自动选择实验类型「${fam.name}」`);
+    } else {
+      // 不猜：保持当前选择，并把后端给的类型显示出来，方便手动选
+      const seen = lastPlot.expTypes.filter(Boolean).join(' / ') || '未提供';
+      setPickNotice(
+        `⚠️ 未能匹配实验类型（后端类型：${seen}），保持当前「${selectedFamilyRef.current}」，请手动选择`
+      );
+    }
+  }, [lastPlot, families]);
+
+  // 由 page.tsx 的侧栏选择器推入的数据集
+  useEffect(() => {
+    if (pickedDataset) pickHandlerRef.current(pickedDataset);
+    // 只在 pickedDataset 变化时触发；handlePickDataset 用 ref 取最新，避免 families
+    // 加载完成时重复绘图
+  }, [pickedDataset]);
 
   // 执行单任务分析
   const analyzeSingle = async (task: 'q1' | 'q2' | 'q3' | 'q4' | 'q5' | 'q6') => {
@@ -305,8 +423,17 @@ export default function ImageAnalysisTab() {
 
       {/* 主内容区 */}
       <div style={styles.main}>
-        {/* 左侧：图像上传 */}
+        {/* 左侧：图像上传（DATAVAULT/OFFLINE 选择器在应用左栏 QUBIT 下方） */}
         <div style={styles.leftPanel}>
+          {plotLoading && (
+            <div style={styles.pickLoading}>
+              <div style={styles.spinnerSmall} />
+              <span>正在绘图...</span>
+            </div>
+          )}
+
+          {pickNotice && <div style={styles.notice}>{pickNotice}</div>}
+
           <div
             style={{
               ...styles.dropZone,
@@ -473,6 +600,9 @@ export default function ImageAnalysisTab() {
               <div style={styles.emptyIcon}>📊</div>
               <div>上传图像开始分析</div>
               <div style={styles.emptySubtext}>
+                也可以从左侧 📂 DATAVAULT 选择数据集，选中即自动绘图
+              </div>
+              <div style={styles.emptySubtext}>
                 支持 DRAG、Rabi、Ramsey、T1 等 30+ 种量子实验图像分析
               </div>
             </div>
@@ -549,11 +679,39 @@ const styles: Record<string, React.CSSProperties> = {
   },
   leftPanel: {
     width: '320px',
+    flexShrink: 0,
     padding: '16px',
     borderRight: '1px solid #334155',
     display: 'flex',
     flexDirection: 'column',
     gap: '12px',
+    overflowY: 'auto',
+  },
+  pickLoading: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    color: '#38bdf8',
+    fontSize: '12px',
+  },
+  spinnerSmall: {
+    width: '12px',
+    height: '12px',
+    border: '2px solid #334155',
+    borderTopColor: '#38bdf8',
+    borderRadius: '50%',
+    animation: 'spin 1s linear infinite',
+    flexShrink: 0,
+  },
+  notice: {
+    padding: '6px 10px',
+    background: '#1e293b',
+    border: '1px solid #334155',
+    borderRadius: '6px',
+    color: '#94a3b8',
+    fontSize: '11px',
+    lineHeight: 1.5,
+    wordBreak: 'break-all',
   },
   dropZone: {
     flex: 1,

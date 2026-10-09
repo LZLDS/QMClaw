@@ -25,6 +25,7 @@ import ChatHistorySidebar from "../components/ChatHistorySidebar";
 import WorkflowHistorySidebar from "../components/WorkflowHistorySidebar";
 import QCATab from "../components/QCATab";
 import ImageAnalysisTab from "../components/tabs/ImageAnalysisTab";
+import DataVaultPicker, { type PickedDataset } from "../components/DataVaultPicker";
 import VariantGenerator from "../components/VariantGenerator";
 
 // Plots directory (must match Express server)
@@ -242,6 +243,12 @@ export default function Dashboard() {
   } | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [plotModified, setPlotModified] = useState(false);
+  // image_analysis 标签：左栏 DATAVAULT/OFFLINE 选中的数据集（变化即触发该标签绘图）
+  const [imageAnalysisPick, setImageAnalysisPick] = useState<PickedDataset | null>(null);
+  const handleImageAnalysisPick = useCallback((ds: PickedDataset) => {
+    // 每次点击都写入新对象引用，保证重复选同一个数据集也能重新绘图
+    setImageAnalysisPick({ ...ds });
+  }, []);
 
   // Command states for collapsible commands
   const [currentRunCommand, setCurrentRunCommand] = useState<string>("");
@@ -1121,6 +1128,25 @@ export default function Dashboard() {
             </div>
           </div>
           )}  {/* End of Qubit selector conditional */}
+
+          {/* image_analysis 标签：DATAVAULT / 📦OFFLINE 选择器（QUBIT 下方） */}
+          {activeTab === "image_analysis" && (
+            <div style={{
+              flex: 1,
+              minHeight: 0,
+              overflow: "auto",
+              display: "flex",
+              flexDirection: "column",
+              padding: "0.5rem",
+            }}>
+              <DataVaultPicker
+                compact
+                maxListHeight={260}
+                onPick={handleImageAnalysisPick}
+                onQuickPlot={handleImageAnalysisPick}
+              />
+            </div>
+          )}
         </aside>
 
         {/* ── Main content ── */}
@@ -1465,7 +1491,7 @@ export default function Dashboard() {
 
           {/* IMAGE ANALYSIS TAB */}
           {activeTab === "image_analysis" && (
-            <ImageAnalysisTab />
+            <ImageAnalysisTab pickedDataset={imageAnalysisPick} />
           )}
 
         </main>

@@ -1,5 +1,65 @@
 # QMClaw 开发进度
 
+## 2026-10-08: image_analysis 移植 DATAVAULT/OFFLINE 选择器
+
+方案见 `tools/image-analysis-port/PLAN.md`。**已实现，人工验证通过（用户确认"效果不错"）。**
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `qmclaw-web/src/components/DataVaultPicker.tsx` | **新增**。从 JobsPanel 的 `DataVaultCard` 原样抽出（-466 行 / +~600 行，逻辑逐行核对无遗漏）。props: `onPick` / `onQuickPlot` / `refreshTrigger` / `compact` / `maxListHeight` |
+| `qmclaw-web/src/components/JobsPanel.tsx` | 删除原 `DataVaultCard` 与其私有类型，改为 `<DataVaultPicker refreshTrigger={...} />`；不传 `onPick`，行为与改前一致 |
+| `qmclaw-web/src/components/tabs/ImageAnalysisTab.tsx` | 选中即调绘图 API 并把 base64 塞进原有拖拽框的两个 state；实验类型自动匹配；新增 `plotLoading` / `pickNotice`；绘图请求带序号以淘汰过期响应。**选择器本体第二轮已移到 `page.tsx` 侧栏**（见下） |
+| `qmclaw-web/src/styles/animations.css` | 补 `@keyframes spin`（此前 `styles.spinner` 引用的 keyframe 全仓库不存在，旋转动画实际没生效） |
+
+### 第二轮返工（同日，按用户反馈）
+
+1. **位置改了**：选择器从 image_analysis 页自己的左栏，移到**应用左栏 QUBIT 下方的空白区**
+   （`page.tsx`，仅 `image_analysis` 标签显示）。`page.tsx` 持有选中结果，经
+   `<ImageAnalysisTab pickedDataset={...} />` 下传；标签内用 ref 调用绘图回调，
+   避免 `families` 加载完成时重复绘图。
+2. **实验类型匹配**：新增 `src/lib/experimentFamily.ts`，含映射表 `DATAVAULT_EXP_TYPE_TO_FAMILY`。
+   覆盖面：实测类型绝大多数都有对应项。原因见下。
+3. experiments 页"图片显示消失"经用户确认是误报，未改动。
+
+### 实验类型匹配：为什么原先"很多都匹配不上"
+
+`families` 是 **VLM prompt 的分类**（vendor `qubitclient/llm/experiment_tools.py` 的
+`ExperimentFamily`），DataVault 的 `experiment_type` 是**采集名**，两套词表基本不重合。
+本地 offline_data 里最高频的是 `iqraw` 与 `pipulse`，二者都无对应 family
+（前者无、后者只有 `optpipulse`），占了数据的绝大部分。
+（具体条数分布属于本地数据特征，不写进仓库。）
+
+⚠️ **给错 family 不报错**：vendor 里 `get_prompt()` 找不到 key 会静默回退到 rabi 的 prompt
+（`qubitclient/llm/experiments/q1_describe_plot.py:171` 等 6 处），结果是"看起来合理但用错模板"的分析。
+因此映射表的目标集合必须限定在**合法 33 个 key**（已核对 6 任务 × 中英 12 个 prompt 字典，完全一致）。
+
+⚠️ **顺带查出的既有 bug（未修）**：`services/qubitclient_service/server.py` 的
+`EXPERIMENT_FAMILIES` 含 `s21peak`、`s21peakmulti`，二者不在那 33 个合法 key 里
+→ 下拉能选中，但分析静默用 rabi 的 prompt。
+
+
+### 关键结论（PLAN 第二节的未知点）
+
+**绘图产物不是按 jobId 寻址的。** 两个绘图接口都直接返回 base64：
+
+- 离线 `api.plotOfflineDatasetV2({dataset_id, command})` → `{success, image:"data:image/png;base64,...", qubit, experiment_type, dataset_name}`（`services/analysis_service/server.py` 的 offline/v2 处理器）
+- 在线 `api.plotExperimentDataset(name, path)` → `{success, image, exp_type, qubit, exp_num}`
+
+`api.plotUrl(jobId)` / `PLOTS_DIR` / `normalizePlotUrl()` 只服务旧的 Express `/sessions/plot` 流程，与本移植无关。
+
+### 匹配实现细节
+
+`families` 的 `id` 全小写（`s21`/`drag`/`t1`/`rabi`…），`name` 是显示名（`S21`/`DRAG`…），
+故按 `id`/`name` 归一化（小写+去非字母数字）后比较，大小写无关。
+
+候选值顺序（`buildFamilyCandidates`）：**映射后的**后端 `experiment_type` → 原始 `experiment_type`
+→ 映射后的文件名 token → token 原文。
+实测离线数据集列表**自带权威 `experiment_type`**（后端 `offline_data_provider` 已从文件名解析+标准化：
+`S21`→`s21`），比前端解析文件名更可靠，故设为优先来源。
+匹配不到 → 保持当前选择，并在提示里回显后端给的类型，方便手选。
+
 ## 2026-09-20: 统一量子测控工具集和 API
 
 ### 背景
@@ -391,7 +451,7 @@ Browser → Express (:3002) → workflow_service (:3008)
 ### 设计方案
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  ▶ COMMAND    sq.iqraw(q3ld4, do_plot=True)          [▼]  │
+│  ▶ COMMAND    sq.iqraw(qXXX, do_plot=True)          [▼]  │
 ├─────────────────────────────────────────────────────────────┤
 │  ▶ PLOT CMD   qter.fitData({exp_num})                [▼]  │
 ├─────────────────────────────────────────────────────────────┤

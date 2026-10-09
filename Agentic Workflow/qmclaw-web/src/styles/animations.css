@@ -9,6 +9,12 @@
   50% { opacity: 0.5; }
 }
 
+/* 共享的 loading 旋转动画（ImageAnalysisTab / 其他 spinner 使用） */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* 运行中节点：绿色边框脉冲动画 */
 .node-status-running {
   border-color: var(--color-success) !important;
