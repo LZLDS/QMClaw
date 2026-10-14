@@ -1,5 +1,76 @@
 # QMClaw 开发进度
 
+## 2026-10-08（二）: image_analysis 切到 qubitclient 的 Ising 模型 + 修 think 标签泄漏
+
+### 查清了「qubitclient 里的模型」
+
+`vendor/QubitClient` 里**没有任何权重文件**（`*.pt/pth/onnx/pkl` 全无，全包 grep
+`torch.load|from_pretrained|state_dict` 零命中）——它是**纯客户端**：
+
+- `qubitclient/llm/llm.py` 的 `QubitLLM` 用 `openai.OpenAI(base_url=...)` 调 OpenAI 兼容端点；
+  `scope_api/models/*.py` 是 OpenAPI 生成的**请求体 schema**，不是神经网络。
+- `research/models/{gemma,Ising,MiniMaxAI}/{download,run}.sh` 才是"模型"的真身：
+  用 modelscope 下载 + `vllm serve` 起服务（如 Ising 默认 `--port 9090`）。
+
+`qubitclient.json`（vendor 与工作区根目录各一份，内容相同）指向：
+
+| 字段 | 值 |
+|---|---|
+| `llm.base_url` | `http://<lqcs-host>:13001/v1` |
+| `llm.model` | `nv-community/Ising-Calibration-1-35B-A3B` |
+
+**实测（用仓库真实实验图 `images/train/good/res_spec_success_2qubit_wide_scan_resonator_a.png`）**：
+端点活着、`/v1/models` 有 2 个模型、**是视觉模型**、答案物理正确且带定量读数
+（谐振器光谱、两个共振峰 ~8280/8560 MHz、背景 ~0.16）。同端点上还有
+`deepseek-ai/DeepSeek-V4.1-Flash`，同样吃图、输出更干净、响应更快。
+
+### 但它原本没被用上
+
+`qubitclient_service._load_config()` 的搜索顺序里**第一顺位**
+`Agentic Workflow/qmclaw-server/config/qubitclient.json` 存在即命中，而那份写的是
+`https://api.deepseek.com/v1` + `deepseek-flash` → vendor 那份根本读不到。
+
+**已改**：把该文件的 `llm` 段切到 `:13001` + Ising（`api_key` 同步换成 vendor 那份）。
+原文件备份为 `qubitclient.json.bak`（两份都命中 `.gitignore`，不涉及推送）。
+**需重启 Python 服务生效**；日志里会打印 `Loaded config from:` 与 `Model:`。
+
+> 顺带查出的既有问题（未修）：搜索顺序第 2 条路径写成
+> `config_base / "vendor" / "QubitClient"` = `Agentic Workflow/vendor/...`，
+> 而 vendor 实际在 `QMClaw-main/vendor/...`（差一层），这条永远不生效。
+
+### 修掉 Ising 的 `</think>` 泄漏
+
+Ising 是 reasoning 模型，输出形如「推理文本 + 闭合标签 `</think>` + 正式答案」，
+而且**只有闭合标签、没有开标签**（开标签被服务端 reasoning parser 吃掉）。
+vendor 原来的清理是 `re.sub(r'<think>[\s\S]*?</think>', '', content)`（要求成对）
+→ 对孤立闭合标签完全无效，整段推理会漏进 Q1–Q6 结果。
+
+改法：`qubitclient/llm/llm.py` 新增**模块级** `_strip_think()`（零正则、零反斜杠），
+`_parse_json_response` 与 `chat()` 的无 schema 分支都改走它。
+**用真实模型输出验证**：清理前 `答案\n</think>\n\n答案` → 清理后干净答案，无残留标签；
+6/6 合成用例通过（成对、孤立闭合、答案在前、只有开标签、空串）。
+
+**已登记进 `tools/lqcs-offline/apply_vendor_fixes.py`（现共 13 条，`--check` exit=0）**。
+这一步是必须的：`vendor/QubitClient` 是 zip 解出来的普通副本（无 `.git`，父仓库 gitignore 了
+`vendor/`），改动只有写进重放器才能存活。
+
+### 顺手修掉：切标签丢分析结果
+
+用户反馈：在 image_analysis 分析完，切到 experiments 再切回来，图和结果全没了。
+
+**根因是组件被卸载，不是"刷新"**：`page.tsx` 里一直写成
+`{activeTab === "image_analysis" && <ImageAnalysisTab ... />}` 这种条件渲染，
+切走即卸载 → React 丢掉它的全部 state（图、Q1–Q6 结果、实验类型、语言），
+回来时重新挂载 + `pickedDataset` 仍在 → 又重跑一次绘图，看起来就像被刷新了。
+侧栏那个 `DataVaultPicker` 同样（筛选/页码/选中项一起重置）。
+
+**改法**：首次进入后**常驻挂载、切走只隐藏**（`display: none`），两处都改。
+用 `imageAnalysisVisited || activeTab === "image_analysis"` 派生挂载条件 ——
+既避免没进过这个标签就提前发健康检查/家族列表请求，又保证首次点击当帧就渲染（不闪空白）。
+
+> 注意：这只解决**页内切标签**。浏览器 F5 刷新仍会丢（没有做持久化）。
+> 若要连刷新都保住，得把图与结果落到 sessionStorage —— 图是 base64，注意容量。
+
 ## 2026-10-08: image_analysis 移植 DATAVAULT/OFFLINE 选择器
 
 方案见 `tools/image-analysis-port/PLAN.md`。**已实现，人工验证通过（用户确认"效果不错"）。**

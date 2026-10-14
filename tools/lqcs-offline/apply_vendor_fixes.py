@@ -200,6 +200,25 @@ def handle_exceptions(func):""",
             logging.warning(f"Error in request: {result.get('error')}")
             continue""",
     },
+    {
+        "rel": 'qubitclient/llm/llm.py',
+        "why": '推理模型（nv-community/Ising-Calibration-1-35B-A3B）的输出形如「推理文本 + 闭合标签 + 正式答案」，而且只有闭合标签没有开标签（开标签被服务端 reasoning parser 吃掉了）。原来那个要求标签成对的正则对孤立的闭合标签完全无效，整段推理会漏进 Q1–Q6 的结果里。这里插入模块级 _strip_think()：有闭合标签就取最后一个之后的内容，之后为空则回退到取开标签之前。',
+        "bad": '    return base64.b64encode(buffer.getvalue()).decode("utf-8")\n',
+        "good": '    return base64.b64encode(buffer.getvalue()).decode("utf-8")\n\ndef _strip_think(content: str) -> str:\n    # 推理模型（如 nv-community/Ising-Calibration-1-35B-A3B）的输出形如\n    # 「推理文本 + 闭合标签 </think> + 正式答案」，而且只有闭合标签、没有开标签\n    # （开标签被服务端的 reasoning parser 吃掉了）。所以不能沿用原来那个\n    # 要求标签成对的正则：它对孤立的闭合标签完全无效，整段推理会漏出去。\n    if "</think>" in content:\n        after = content.rsplit("</think>", 1)[-1]\n        if after.strip():\n            # 答案在最后一个闭合标签之后（标签成对时这条规则同样成立）\n            return after.strip()\n        # 形如「答案 + 推理块」：答案在标签之前\n        return content.split("<think>", 1)[0].replace("</think>", "").strip()\n    if "<think>" in content:\n        # 只有开标签、没有闭合：丢掉从这里开始的全部内容\n        return content.split("<think>", 1)[0].strip()\n    return content.strip()\n\n\n',
+    },
+    {
+        "rel": 'qubitclient/llm/llm.py',
+        "why": 'JSON 任务（Q1/Q2/Q4/Q5/Q6）改走 _strip_think()，替代那个要求标签成对的正则。',
+        "bad": "        cleaned = re.sub(r'<think>[\\s\\S]*?</think>', '', content).strip()\n",
+        "good": '        cleaned = _strip_think(content)\n',
+    },
+    {
+        "rel": 'qubitclient/llm/llm.py',
+        "why": '无 response_schema 的任务（如 Q3 科学推理）在 chat() 里直接返回原始 content，完全没做思考内容清理，推理过程和闭合标签会显示到界面上。',
+        "bad": '        if response_schema is not None:\n            # 尝试提取 JSON（去掉思考过程等）\n            return self._parse_json_response(content)\n        return content\n',
+        "good": '        if response_schema is not None:\n            # 尝试提取 JSON（去掉思考过程等）\n            return self._parse_json_response(content)\n        # 无 schema 的任务（如 Q3 科学推理）原来直接把原始 content 返回，\n        # 推理模型的思考过程会连同 </think> 一起漏进界面，这里同样清理。\n        return _strip_think(content)\n',
+    },
+
 ]
 
 
