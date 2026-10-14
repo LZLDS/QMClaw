@@ -39,3 +39,17 @@ quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可�
 8. 计划模式下，或者用户明确让制定计划的时候，需要多向用户提问，详细了解需求。
 9. 当前系统有后端打印日志的过滤器，只有满足特定声明逻辑的日志才能被打印到后端的终端窗口里。所以当你要增加后端日志的时候，需要检查一下后端日志过滤器(Agentic Workflow\qmclaw-server\src\index.ts)。
 10. python用这个C:\Users\HUAWEI\.conda\envs\qmclaw\python.exe
+
+# Compaction 压缩规则（自动压缩时生效）
+## 摘要必须保留内容
+1. 项目架构：QMC Pro / QMC Claw微服务分层定义、各个微服务调用关系（Agent、Workflow、Quantum、Analysis、Image、QubitClient）
+2. 关键技术决策：自动驾驶类比的规则引擎+大模型混合方案
+3. 未完成任务清单、当前开发阶段
+4. 核心代码接口定义、重要实验测控逻辑
+
+
+## 需要简化/丢弃
+1. 反复调试的中间失败日志、重复报错
+2. 临时探索性的非核心讨论
+3. 无关闲聊内容
+4. 确认已修复的bug

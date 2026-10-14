@@ -17,6 +17,8 @@ import { CompactSessionManager } from "../components/SessionManager";
 import ImageClassificationPanel from "../components/ImageClassificationPanel";
 import AgentChatPanel from "../components/AgentChatPanel";
 import HermesChatPanel from "../components/HermesChatPanel";
+import HermesSessionsSidebar from "../components/HermesSessionsSidebar";
+import HermesToolbar from "../components/HermesToolbar";
 import QubitParamsPanel from "../components/QubitParamsPanel";
 import ModelRegistry from "../components/ModelRegistry";
 import ExperimentConfigs from "../components/ExperimentConfigs";
@@ -32,32 +34,10 @@ import VariantGenerator from "../components/VariantGenerator";
 // Uses relative path from project root, or PLOTS_DIR env var
 const PLOTS_DIR = process.env.PLOTS_DIR || "/plots";
 
-// ── Server health check (status dots + hardware status) ──────────────────────────────────────────
-
-interface QuickStatus {
-  labrad: string;
-  ray: string;
-  datavault: string;
-  message: string;
-}
-
-function StatusDot({ label, status }: { label: string; status: string }) {
-  const colors: Record<string, string> = {
-    ok: "#22c55e",
-    warning: "#f59e0b",
-    error: "#ef4444",
-  };
-  const color = colors[status] || "#64748b";
-  return (
-    <span title={`${label}: ${status}`} style={{ color, fontSize: "0.75rem" }}>
-      {label} {status === "ok" ? "✅" : status === "warning" ? "⚠️" : "❌"}
-    </span>
-  );
-}
+// ── Server health check ──────────────────────────────────────────────────────────────────────────
 
 async function checkHealth(
   setServerOk: (v: boolean) => void,
-  setQuickStatus: (s: QuickStatus | null) => void,
   onOfflineStatus?: (mode: string, available: boolean) => void
 ) {
   try {
@@ -65,13 +45,6 @@ async function checkHealth(
       express: string; backend: { status: string; ready: boolean } | "unreachable";
     };
     setServerOk(true);
-    // Also fetch quick hardware status
-    try {
-      const qs = await api.getQuickStatus() as QuickStatus;
-      setQuickStatus(qs);
-    } catch {
-      setQuickStatus(null);
-    }
     // Fetch quantum service mode status
     if (onOfflineStatus) {
       try {
@@ -83,7 +56,6 @@ async function checkHealth(
     }
   } catch {
     setServerOk(false);
-    setQuickStatus(null);
     if (onOfflineStatus) {
       onOfflineStatus("auto", false);
     }
@@ -153,7 +125,6 @@ function ActionBtn({ label, on, color, disabled }: { label: string; on: () => vo
 
 export default function Dashboard() {
   const [serverOk, setServerOk] = useState(false);
-  const [quickStatus, setQuickStatus] = useState<QuickStatus | null>(null);
   const [running, setRunning] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
@@ -341,11 +312,11 @@ export default function Dashboard() {
   }, [logs]);
 
   useEffect(() => {
-    checkHealth(setServerOk, setQuickStatus, (mode, available) => {
+    checkHealth(setServerOk, (mode, available) => {
       setQuantumMode(mode as "online" | "offline" | "auto");
       setOfflineAvailable(available);
     });
-    const interval = setInterval(() => checkHealth(setServerOk, setQuickStatus, (mode, available) => {
+    const interval = setInterval(() => checkHealth(setServerOk, (mode, available) => {
       setQuantumMode(mode as "online" | "offline" | "auto");
       setOfflineAvailable(available);
     }), 30_000);
@@ -571,8 +542,9 @@ export default function Dashboard() {
         }
 
         // Show plot if available
-        if (result.plotPath) {
-          setPlotUrl(normalizePlotUrl(result.plotPath));
+        const actualResult = result.result as { plotPath?: string } | undefined;
+        if (actualResult?.plotPath) {
+          setPlotUrl(normalizePlotUrl(actualResult.plotPath));
           addLog("📊 Plot generated from historical data");
         }
 
@@ -874,22 +846,28 @@ export default function Dashboard() {
     <div style={{ height: "100vh", background: "#0f172a", color: "#e2e8f0", fontFamily: "system-ui, sans-serif", display: "flex", flexDirection: "column", overflow: "hidden" }}>
 
       {/* Header */}
-      <header style={{ padding: "0.75rem 1.5rem", borderBottom: "1px solid #1e293b", display: "flex", alignItems: "center", gap: "1rem", flexShrink: 0 }}>
-        <span style={{ fontSize: "1.5rem" }}>⚡ qmclaw</span>
-        <span style={{ color: "#64748b", fontSize: "0.875rem" }}>Quantum Measurement & Calibration</span>
-        <div style={{ marginLeft: "auto", display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+      <header style={{ padding: "0.5rem 1rem", borderBottom: "1px solid #1e293b", display: "flex", alignItems: "center", gap: "0.5rem", flexShrink: 0, flexWrap: "wrap" }}>
+        <span style={{ fontSize: "1.2rem" }}>⚡ qmclaw</span>
+
+        {/* Tab bar - fixed at top */}
+        <div style={{ display: "flex", gap: "0.25rem", marginLeft: "1rem" }}>
+          {(["experiments", "workflow", "agent", "images", "hermes", "qca", "image_analysis"] as Tab[]).map((t) => (
+            <button key={t} onClick={() => setActiveTab(t)} style={{
+              padding: "0.3rem 0.75rem", borderRadius: "0.375rem", border: "none",
+              background: activeTab === t ? "#38bdf8" : "transparent",
+              color: activeTab === t ? "#0f172a" : "#94a3b8",
+              fontWeight: 600, cursor: "pointer", textTransform: "capitalize", fontSize: "0.8rem",
+            }}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
           <CompactSessionManager />
           <span title="Express server" style={{ color: serverOk ? "#22c55e" : "#ef4444", fontSize: "0.75rem" }}>
             Express {serverOk ? "✅" : "❌"}
           </span>
-          {/* Hardware status indicators */}
-          {quickStatus && (
-            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", padding: "0.25rem 0.5rem", background: "#1e293b", borderRadius: "0.375rem" }}>
-              <StatusDot label="LabRAD" status={quickStatus.labrad} />
-              <StatusDot label="Ray" status={quickStatus.ray} />
-              <StatusDot label="DataVault" status={quickStatus.datavault} />
-            </div>
-          )}
           {/* Offline mode selector */}
           <select
             value={quantumMode}
@@ -955,7 +933,12 @@ export default function Dashboard() {
       </header>
 
       {/* Body */}
-      <div style={{ display: "grid", gridTemplateColumns: "220px 1fr 280px", flex: 1, overflow: "hidden" }}>
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: activeTab === "hermes" ? "220px 1fr" : "220px 1fr 280px",
+        flex: 1,
+        overflow: "hidden"
+      }}>
 
         {/* ── Left sidebar: dynamic content based on active tab ── */}
         <aside style={{ borderRight: "1px solid #1e293b", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -996,8 +979,14 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Compact Qubit selector (bottom, fixed height) - not for images tab */}
-          {activeTab !== "images" && activeTab !== "experiments" && (
+          {activeTab === "hermes" && (
+            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
+              <HermesSessionsSidebar />
+            </div>
+          )}
+
+          {/* Compact Qubit selector (bottom, fixed height) - not for images/experiments/hermes tabs */}
+          {activeTab !== "images" && activeTab !== "experiments" && activeTab !== "hermes" && (
           <div style={{
             borderTop: "1px solid #1e293b",
             padding: "0.5rem",
@@ -1162,20 +1151,6 @@ export default function Dashboard() {
         {/* ── Main content ── */}
         <main style={{ overflow: "auto", padding: "1rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
 
-          {/* Tab bar */}
-          <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0 }}>
-            {(["experiments", "workflow", "agent", "images", "hermes", "qca", "image_analysis"] as Tab[]).map((t) => (
-              <button key={t} onClick={() => setActiveTab(t)} style={{
-                padding: "0.4rem 1rem", borderRadius: "0.375rem", border: "none",
-                background: activeTab === t ? "#38bdf8" : "#1e293b",
-                color: activeTab === t ? "#0f172a" : "#94a3b8",
-                fontWeight: 600, cursor: "pointer", textTransform: "capitalize", fontSize: "0.875rem",
-              }}>
-                {t}
-              </button>
-            ))}
-          </div>
-
           {/* EXPERIMENTS TAB */}
           {activeTab === "experiments" && (
             <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
@@ -1221,9 +1196,9 @@ export default function Dashboard() {
                 {/* Run Command */}
                 <CollapsibleCommand
                   type="command"
-                  command={currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)"}
+                  command={(currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)").replaceAll("{qubit}", selectedQubit)}
                   onCommandChange={setCurrentRunCommand}
-                  onRun={() => runCustom(currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)")}
+                  onRun={() => runCustom((currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)").replaceAll("{qubit}", selectedQubit))}
                   onSave={() => handleSaveRunCommand(selectedExp, currentRunCommand)}
                   disabled={running}
                   isRunning={isRunningCommand}
@@ -1333,18 +1308,7 @@ export default function Dashboard() {
                 <button
                   onClick={() => {
                     if (running) return;
-                    setIsRunningPlot(true);
-                    const cmd = currentPlotCommand || `qter.fitData({exp_num})`;
-                    api.runPlot(cmd, selectedExp).then((result) => {
-                      if (result.success) {
-                        setPlotUrl(result.image || null);
-                        addLog("✅ Plot completed");
-                      } else {
-                        addLog("❌ Plot failed: " + result.error, true);
-                      }
-                    }).finally(() => {
-                      setIsRunningPlot(false);
-                    });
+                    handlePlot(currentPlotCommand || `qter.fitData({exp_num})`);
                   }}
                   disabled={running || isRunningPlot}
                   style={{
@@ -1491,7 +1455,68 @@ export default function Dashboard() {
 
           {/* HERMES TAB */}
           {activeTab === "hermes" && (
-            <HermesChatPanel />
+            <div style={{ display: "flex", height: "100%", position: "relative" }}>
+              {/* Hermes Chat Panel - fills left side */}
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+                <HermesChatPanel />
+              </div>
+
+              {/* Right side: Hermes Toolbar (top) + Log Panel (bottom, compact) */}
+              <div style={{
+                width: "300px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+                padding: "0.5rem",
+                background: "#0a0f1a",
+                borderLeft: "1px solid #1e293b",
+              }}>
+                {/* Hermes Toolbar - Top Right Sidebar */}
+                <HermesToolbar />
+
+                {/* Compact Log Panel - Bottom Right */}
+                <div style={{
+                  flex: 1,
+                  background: "#0a0f1a",
+                  border: `1px solid rgba(56, 189, 248, 0.25)`,
+                  borderRadius: "8px",
+                  display: "flex",
+                  flexDirection: "column",
+                  overflow: "hidden",
+                }}>
+                  <div style={{
+                    padding: "0.5rem 0.75rem",
+                    fontSize: "0.65rem",
+                    fontWeight: 600,
+                    color: "#334569",
+                    letterSpacing: "0.1em",
+                    borderBottom: "1px solid rgba(56, 189, 248, 0.15)",
+                    flexShrink: 0,
+                  }}>
+                    OUTPUT
+                  </div>
+                  <div style={{
+                    flex: 1,
+                    overflow: "auto",
+                    padding: "0.5rem 0.75rem",
+                    fontFamily: "monospace",
+                    fontSize: "0.65rem",
+                    lineHeight: 1.6,
+                  }}>
+                    {logs.slice(-30).map((line, i) => (
+                      <div key={i} style={{
+                        color: line.includes("❌") ? "#f87171" : line.includes("▶") ? "#38bdf8" : "#64748b",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-all",
+                      }}>
+                        {line}
+                      </div>
+                    ))}
+                    <div ref={logsEndRef} />
+                  </div>
+                </div>
+              </div>
+            </div>
           )}
 
           {/* QCA TAB */}
@@ -1515,7 +1540,8 @@ export default function Dashboard() {
 
         </main>
 
-        {/* ── Log panel ── */}
+        {/* ── Log panel (only for non-hermes tabs) ── */}
+        {activeTab !== "hermes" && (
         <aside style={{
           borderLeft: "1px solid #1e293b",
           background: "#0a0f1a",
@@ -1547,6 +1573,7 @@ export default function Dashboard() {
             <div ref={logsEndRef} />
           </div>
         </aside>
+        )}
       </div>
 
       {/* Qubit Parameters Panel Modal */}
