@@ -249,6 +249,14 @@ export default function Dashboard() {
     // 每次点击都写入新对象引用，保证重复选同一个数据集也能重新绘图
     setImageAnalysisPick({ ...ds });
   }, []);
+  // image_analysis 首次进入后常驻挂载（切走只隐藏），否则切标签会丢分析结果。
+  // 用「访问过」标志而不是一直挂载：没进过这个标签就不必提前发健康检查/家族列表请求；
+  // 同时 || 当前标签 保证首次点击当帧就渲染，不会闪一帧空白。
+  const [imageAnalysisVisited, setImageAnalysisVisited] = useState(false);
+  useEffect(() => {
+    if (activeTab === "image_analysis") setImageAnalysisVisited(true);
+  }, [activeTab]);
+  const imageAnalysisMounted = imageAnalysisVisited || activeTab === "image_analysis";
 
   // Command states for collapsible commands
   const [currentRunCommand, setCurrentRunCommand] = useState<string>("");
@@ -1129,13 +1137,15 @@ export default function Dashboard() {
           </div>
           )}  {/* End of Qubit selector conditional */}
 
-          {/* image_analysis 标签：DATAVAULT / 📦OFFLINE 选择器（QUBIT 下方） */}
-          {activeTab === "image_analysis" && (
+          {/* image_analysis 标签：DATAVAULT / 📦OFFLINE 选择器（QUBIT 下方）
+              首次进入后常驻挂载、切走只隐藏 —— 条件渲染会卸载组件，
+              把筛选/页码/选中项连同分析结果一起重置。 */}
+          {imageAnalysisMounted && (
             <div style={{
               flex: 1,
               minHeight: 0,
               overflow: "auto",
-              display: "flex",
+              display: activeTab === "image_analysis" ? "flex" : "none",
               flexDirection: "column",
               padding: "0.5rem",
             }}>
@@ -1489,9 +1499,18 @@ export default function Dashboard() {
             <QCATab />
           )}
 
-          {/* IMAGE ANALYSIS TAB */}
-          {activeTab === "image_analysis" && (
-            <ImageAnalysisTab pickedDataset={imageAnalysisPick} />
+          {/* IMAGE ANALYSIS TAB
+              常驻挂载（首次进入后才挂）、切走只隐藏：条件渲染会卸载组件，
+              之前选好的图与 Q1–Q6 分析结果会全部丢失。 */}
+          {imageAnalysisMounted && (
+            <div style={{
+              flex: 1,
+              minHeight: 0,
+              display: activeTab === "image_analysis" ? "flex" : "none",
+              flexDirection: "column",
+            }}>
+              <ImageAnalysisTab pickedDataset={imageAnalysisPick} />
+            </div>
           )}
 
         </main>
