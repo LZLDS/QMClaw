@@ -39,6 +39,13 @@ quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可�
 8. 计划模式下，或者用户明确让制定计划的时候，需要多向用户提问，详细了解需求。
 9. 当前系统有后端打印日志的过滤器，只有满足特定声明逻辑的日志才能被打印到后端的终端窗口里。所以当你要增加后端日志的时候，需要检查一下后端日志过滤器(Agentic Workflow\qmclaw-server\src\index.ts)。
 10. python用这个C:\Users\HUAWEI\.conda\envs\qmclaw\python.exe
+11. **推送由人发起**：改动可以本地提交，但 `git push` 必须等用户明确说"推"才执行，不要主动推送。
+12. **提交身份固定**：本仓库用 `user.name = LZLDS`、
+    `user.email = 331927507+LZLDS@users.noreply.github.com`（noreply，避免把真实邮箱
+    写进公开仓库的提交元数据）。已设在 `.git/config`（仓库级，非全局）。
+13. **不外传本地环境信息**：内网/服务地址、真实 qubit 名、离线数据条数与规模、
+    设备会话路径等，一律不进仓库。文档里用 `<lqcs-host>`、`<nnscope-host>`、`qXXX`
+    这类占位符；`.gitignore` 已挡住 `qubitclient.json` 与 `data/`。
 
 # Compaction 压缩规则（自动压缩时生效）
 ## 摘要必须保留内容
