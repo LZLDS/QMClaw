@@ -38,7 +38,10 @@ quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可�
 7. 当需求涉及较多修改时，先制定计划，由用户确认后才能执行。
 8. 计划模式下，或者用户明确让制定计划的时候，需要多向用户提问，详细了解需求。
 9. 当前系统有后端打印日志的过滤器，只有满足特定声明逻辑的日志才能被打印到后端的终端窗口里。所以当你要增加后端日志的时候，需要检查一下后端日志过滤器(Agentic Workflow\qmclaw-server\src\index.ts)。
-10. python用这个C:\Users\HUAWEI\.conda\envs\qmclaw\python.exe
+10. python 用这个：`D:\访问github\deploy\qmclaw\python.exe`（Python 3.11，已装
+    qubitclient / matplotlib / numpy / torch / openai）。注意它在**仓库外**
+    （`QMClaw-main` 的同级 `deploy\` 目录）；系统自带的 `D:\anacanda\python.exe`
+    是 3.7，跑不了要求 3.10+ 的 vendor 包。
 11. **推送由人发起**：改动可以本地提交，但 `git push` 必须等用户明确说"推"才执行，不要主动推送。
 12. **提交身份固定**：本仓库用 `user.name = LZLDS`、
     `user.email = 331927507+LZLDS@users.noreply.github.com`（noreply，避免把真实邮箱
